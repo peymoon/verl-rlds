@@ -147,7 +147,8 @@ def _get_input_embeds(
     image_mask, video_mask = None, None
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
-        image_embeds, deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        _image_out = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, deepstack_image_embeds = _image_out.pooler_output, _image_out.deepstack_features
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
@@ -165,7 +166,8 @@ def _get_input_embeds(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
-        video_embeds, deepstack_video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        _video_out = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds, deepstack_video_embeds = _video_out.pooler_output, _video_out.deepstack_features
         n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
@@ -210,7 +212,8 @@ def _get_input_embeds(
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
-        image_embeds, dummy_deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        _dummy_out = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, dummy_deepstack_image_embeds = _dummy_out.pooler_output, _dummy_out.deepstack_features
         inputs_embeds += 0.0 * image_embeds.mean()
         for emb in dummy_deepstack_image_embeds or []:
             inputs_embeds += 0.0 * emb.mean()

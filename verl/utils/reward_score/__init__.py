@@ -90,6 +90,10 @@ def default_compute_score(
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
+    elif data_source in ["UCSC-VLAA/VLAA-Thinking"]:
+        from . import vlaa
+
+        res = vlaa.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

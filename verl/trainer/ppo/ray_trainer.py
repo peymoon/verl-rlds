@@ -433,10 +433,19 @@ class RayPPOTrainer:
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            # Add stable question identifiers so rollouts can be matched back to dataset rows
+            if "uid" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump["uid"] = list(batch.non_tensor_batch["uid"])
+            if "extra_info" in batch.non_tensor_batch:
+                extra_infos = batch.non_tensor_batch["extra_info"]
+                for meta_key in ("index", "question", "verifier_type", "category"):
+                    vals = [ei.get(meta_key) if isinstance(ei, dict) else None for ei in extra_infos]
+                    if any(v is not None for v in vals):
+                        reward_extra_infos_to_dump[meta_key] = vals
 
             self._dump_generations(
                 inputs=inputs,
@@ -525,6 +534,16 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
+            # Collect question metadata for rollout dumps
+            if "extra_info" in test_batch.non_tensor_batch:
+                extra_infos = test_batch.non_tensor_batch["extra_info"]
+                for meta_key in ("index", "question", "verifier_type", "category"):
+                    vals = [ei.get(meta_key) if isinstance(ei, dict) else None for ei in extra_infos]
+                    if any(v is not None for v in vals):
+                        if meta_key not in reward_extra_infos_dict:
+                            reward_extra_infos_dict[meta_key] = []
+                        reward_extra_infos_dict[meta_key].extend(vals)
+
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -597,12 +616,16 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            val_dump_extras = reward_extra_infos_dict.copy()
+            # Add uid so each row can be matched back to its question across rollouts/GPUs
+            if len(sample_uids) == len(sample_scores):
+                val_dump_extras["uid"] = [str(u) for u in sample_uids]
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_infos_dict=val_dump_extras,
                 dump_path=val_data_dir,
             )
 
