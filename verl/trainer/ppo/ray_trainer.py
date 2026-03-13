@@ -437,6 +437,15 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            # Save per-sequence log probs (sum of token-level log probs; padding is already zeroed)
+            if "old_log_probs" in batch.batch:
+                reward_extra_infos_to_dump["old_log_probs"] = (
+                    batch.batch["old_log_probs"].sum(-1).cpu().tolist()
+                )
+            if "ref_log_prob" in batch.batch:
+                reward_extra_infos_to_dump["ref_log_prob"] = (
+                    batch.batch["ref_log_prob"].sum(-1).cpu().tolist()
+                )
             # Add stable question identifiers so rollouts can be matched back to dataset rows
             if "uid" in batch.non_tensor_batch:
                 reward_extra_infos_to_dump["uid"] = list(batch.non_tensor_batch["uid"])

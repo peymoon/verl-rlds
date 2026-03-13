@@ -1,11 +1,20 @@
 set -x
 ENGINE=${1:-vllm}
+# Point val_files at the full ~25K-row parquet created with train_ratio=0.0:
+#   cd /workspace/rl_data_selection
+#   python prepare_vlaa_dataset.py --output_dir data/vlaa_grpo --train_ratio 0.0
+# That writes data/vlaa_grpo_full/test.parquet with ALL rows.
+#
+# total_epochs=0 + val_before_train=True → runs _validate() once then exits.
+# No FSDP actor update, no optimizer state, no rollout buffer accumulation.
+# val_batch_size can be larger than train_batch_size (no gradient memory needed).
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_20_90.parquet \
-    data.val_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/test_10_100.parquet \
-    data.train_batch_size=128 \
+    data.train_files=/workspace/rl_data_selection/data/vlaa_grpo_20/test.parquet \
+    data.val_files=/workspace/rl_data_selection/data/vlaa_grpo_full_test/test.parquet \
+    data.train_batch_size=64 \
+    data.val_batch_size=256 \
     data.max_prompt_length=4096 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
@@ -33,22 +42,20 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.val_kwargs.n=8 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='verl_grpo_example_vlaa_grpo_full' \
-    trainer.experiment_name='qwen3_vl_2b_function_rm' \
+    trainer.project_name='verl_grpo_vlaa_rollout_only' \
+    trainer.experiment_name='qwen3_vl_2b_rollout_full' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=6 \
-    trainer.test_freq=3 \
-    trainer.total_epochs=1 \
-    trainer.default_local_dir=/workspace/peyman/outputs/checkpoints/vlaa_parquet_splits/train_20_90 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=1 \
+    trainer.total_epochs=0 \
+    trainer.default_local_dir=/workspace/peyman/outputs/checkpoints/vlaa_rollout_only \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    trainer.rollout_data_dir=/workspace/peyman/outputs/rollouts/vlaa_parquet_splits/train_20_90 \
-    trainer.val_before_train=False \
-    # trainer.resume_mode=resume_path \
-    # trainer.resume_from_path=/workspace/peyman/outputs/checkpoints/vlaa_hard_20/global_step_3 \
-    trainer.validation_data_dir=/workspace/peyman/outputs/rollouts/vlaa_parquet_splits/test_20_90_val $@
+    trainer.val_before_train=True \
+    trainer.validation_data_dir=/workspace/peyman/outputs/rollouts/vlaa_full_rollout $@
