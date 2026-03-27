@@ -1,9 +1,12 @@
 set -x
-ENGINE=${1:-vllm}
+DATASET=${1:-train_5_90}
+ENGINE=${2:-vllm}
+shift || true
+shift || true
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,2,3,4"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/selected_k295_r2_interpolated_mmd_top10pct.parquet \
+    data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/${DATASET}.parquet \
     data.val_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/test_10_100.parquet \
     data.train_batch_size=128 \
     data.max_prompt_length=4096 \
@@ -39,17 +42,17 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_vlaa_grpo_full' \
-    trainer.experiment_name='selected_k295_r2_interpolated_mmd_10_top10pct_qwen3_vl_2b' \
+    trainer.experiment_name="${DATASET}_qwen3_vl_2b" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=3 \
     trainer.total_epochs=10 \
-    trainer.default_local_dir=/workspace/peyman/outputs/checkpoints/vlaa_parquet_splits/sselected_k295_r2_interpolated_mmd_10_top10pct \
+    trainer.default_local_dir=/workspace/peyman/outputs/checkpoints/vlaa_parquet_splits/${DATASET} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    trainer.rollout_data_dir=/workspace/peyman/outputs/rollouts/vlaa_parquet_splits/sselected_k295_r2_interpolated_mmd_10_top10pct \
+    trainer.rollout_data_dir=/workspace/peyman/outputs/rollouts/vlaa_parquet_splits/${DATASET} \
     trainer.val_before_train=True \
-    trainer.validation_data_dir=/workspace/peyman/outputs/rollouts/vlaa_parquet_splits/sselected_k295_r2_interpolated_mmd_10_top10pct_val $@
+    trainer.validation_data_dir=/workspace/peyman/outputs/rollouts/vlaa_parquet_splits/${DATASET}_val "$@"
     # trainer.resume_mode=resume_path \
     # trainer.resume_from_path=/workspace/peyman/outputs/checkpoints/vlaa_hard_20/global_step_3 \
     
