@@ -111,6 +111,96 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+# config for online data selection during training
+# When method is "none" (default), the full dataset is used every epoch.
+# Set method to "random", "dots", or "cluster" to enable adaptive selection.
+data_selection:
+
+  # Selection method: "none" | "random" | "dots" | "cluster"
+  method: none
+
+  # When to apply reselect_interval:
+  #   "epoch" — at the start of each epoch (every N epochs).
+  #   "step"  — every N completed training steps (mid-epoch; refreshes dataloader iterator).
+  reselect_schedule: epoch
+
+  # Meaning depends on reselect_schedule: every N epochs, or every N optimizer steps.
+  # Use 0 to disable timed reselection (not recommended when selection is enabled).
+  reselect_interval: 1
+
+  # Absolute budget (number of samples per training window); null = use pct
+  selection_budget: null
+
+  # Budget as percentage of full dataset (used when selection_budget is null)
+  selection_budget_pct: 100.0
+
+  # Cluster-specific settings (used when method=cluster)
+  cluster:
+
+    # Path to pre-computed cluster_arrays.npz (embeddings, centroids, assignments)
+    cluster_arrays_file: null
+
+    # Path to embeddings .npz (clusters computed at init if cluster_arrays_file is null)
+    embeddings_file: null
+
+    # Number of clusters for KMeans
+    n_clusters: 50
+
+    # Number of representative samples per cluster for reference rollouts
+    n_reps: 5
+
+    # Between-cluster strategy: "top_clusters" | "weighted" | "scored" | "interpolated"
+    strategy: scored
+
+    # Within-cluster selection: "centroid_nearest" | "mmd"
+    within_cluster_method: centroid_nearest
+
+    # Representative selection: "medoid" | "centroid_nearest"
+    representative_method: medoid
+
+    # DOTS interpolation temperature (for "interpolated" strategy)
+    dots_temperature: 0.05
+
+    # Number of nearest references for DOTS interpolation
+    dots_top_k: 64
+
+    # Softmax temperature for composite score budget allocation
+    score_temperature: 0.1
+
+    # Transferability: exclude clusters with cosine sim above this
+    transferability_sim_threshold: 0.9
+
+    # Gaussian kernel bandwidth for density and MMD
+    density_gamma: 1.0
+    mmd_gamma: 1.0
+
+  # DOTS-specific settings (used when method=dots)
+  dots:
+
+    # Number of random reference samples per selection round
+    ref_size: 256
+
+    # Target difficulty (0=easy, 1=hard, 0.5=frontier)
+    alpha: 0.5
+
+    # Softmax temperature for difficulty-based sampling
+    tau: 0.001
+
+    # Path to teacher model checkpoint (null = use interpolation fallback)
+    teacher_checkpoint: null
+
+    # Teacher model name
+    teacher_model_name: null
+
+    # Batch size for teacher prediction
+    teacher_batch_size: 32
+
+    # Whether to use replay buffer
+    use_replay: false
+
+    # Replay buffer weight
+    replay_sigma: 1.0
+
 # config for the trainer
 trainer:
 

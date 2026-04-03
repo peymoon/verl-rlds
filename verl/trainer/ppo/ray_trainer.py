@@ -303,6 +303,14 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        self.collate_fn = collate_fn
+        if self.collate_fn is None:
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            self.collate_fn = default_collate_fn
+
+        self._init_data_selector()
+        self._correct_total_training_steps_for_selection()
+
         self.checkpoint_manager = None
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -386,6 +394,225 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    # ------------------------------------------------------------------
+    # Online data selection
+    # ------------------------------------------------------------------
+
+    def _init_data_selector(self):
+        """Initialize the data selector based on config, if configured."""
+        self.data_selector = None
+        self._data_selection_active = False
+        self._data_selection_schedule = "epoch"
+        self._data_selection_initial_pending = False
+
+        ds_config = self.config.get("data_selection", None)
+        if ds_config is None:
+            return
+
+        method = ds_config.get("method", "none") if ds_config else "none"
+        if method == "none":
+            return
+
+        from verl.trainer.ppo.data_selector import build_selector
+        self.data_selector = build_selector(ds_config)
+        self.data_selector.initialize(self.train_dataset, self.collate_fn)
+        self._data_selection_active = True
+        self._data_selection_schedule = ds_config.get("reselect_schedule", "epoch")
+        self._data_selection_initial_pending = self._data_selection_schedule == "step"
+        print(
+            f"[DataSelection] Active: method={method}, "
+            f"schedule={self._data_selection_schedule}, "
+            f"reselect_interval={ds_config.get('reselect_interval', 1)}"
+        )
+
+    def _correct_total_training_steps_for_selection(self):
+        """Recalculate total_training_steps when data selection reduces per-epoch batches.
+
+        _create_dataloader() computes total_training_steps from the full dataset BEFORE
+        data selection runs. When selection is active with a budget < 100%, the LR scheduler
+        would see e.g. 8850 total steps but only 850 actually occur (10% budget × 50 epochs).
+        This corrects the config so the scheduler is calibrated to real training volume.
+        """
+        if not self._data_selection_active:
+            return
+        if self.config.trainer.total_training_steps is not None:
+            # User explicitly set this; respect it.
+            return
+
+        ds_config = self.config.get("data_selection", {})
+        budget_pct = float(ds_config.get("selection_budget_pct", 100.0))
+        selection_budget = ds_config.get("selection_budget", None)
+        if budget_pct >= 100.0 and selection_budget is None:
+            return
+
+        n = len(self.train_dataset)
+        batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        effective_n = int(selection_budget) if selection_budget is not None else int(n * budget_pct / 100.0)
+        batches_per_epoch = max(1, effective_n // batch_size)
+        corrected_steps = batches_per_epoch * self.config.trainer.total_epochs
+
+        print(
+            f"[DataSelection] Correcting total_training_steps: {self.total_training_steps} → {corrected_steps} "
+            f"({budget_pct:.1f}% of {n} samples = ~{effective_n}, "
+            f"{batches_per_epoch} batches/epoch × {self.config.trainer.total_epochs} epochs)"
+        )
+        self.total_training_steps = corrected_steps
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = corrected_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = corrected_steps
+        except Exception as e:
+            print(f"[DataSelection] Warning: Could not update total_training_steps in config: {e}")
+
+    def _maybe_reselect_data(self, epoch: int) -> dict:
+        """Run data selection at epoch start when schedule is 'epoch' and interval matches."""
+        if not self._data_selection_active:
+            return {}
+        if self._data_selection_schedule != "epoch":
+            return {}
+        if not self.data_selector.should_reselect_epoch(epoch):
+            return {}
+        return self._run_data_selection_round(trigger="epoch")
+
+    def _run_data_selection_round(self, trigger: str = "epoch") -> dict:
+        """One full selection: reference rollouts (if any) → select indices → rebuild dataloader.
+
+        Used from epoch hooks (schedule=epoch) or mid-training (schedule=step).
+        """
+        if not self._data_selection_active:
+            return {}
+
+        print(f"\n[DataSelection] Re-selecting data ({trigger}) at global_step={self.global_steps}...")
+        metrics = {}
+
+        ref_indices = self.data_selector.get_reference_indices()
+
+        if len(ref_indices) > 0:
+            ref_rewards = self._run_reference_rollouts(ref_indices)
+            self.data_selector.update_rewards(ref_indices, ref_rewards)
+            metrics["data_selection/n_ref_samples"] = len(ref_indices)
+            metrics["data_selection/ref_reward_mean"] = float(ref_rewards.mean())
+
+        budget = self.data_selector.get_selection_budget(len(self.train_dataset))
+        selected_indices = self.data_selector.select(budget)
+
+        if len(selected_indices) > 0:
+            self._rebuild_dataloader(selected_indices)
+            metrics["data_selection/n_selected"] = len(selected_indices)
+            metrics["data_selection/selection_pct"] = (
+                100.0 * len(selected_indices) / len(self.train_dataset)
+            )
+
+        metrics.update(self.data_selector.get_metrics())
+        return metrics
+
+    def _run_reference_rollouts(self, ref_indices: list) -> np.ndarray:
+        """Roll out the current policy on reference samples and collect rewards.
+
+        Uses the same rollout infrastructure as training but on a specific
+        subset of prompts. Returns (n_ref, n_rollouts) reward array.
+
+        Follows the same generate → sleep → reward → wake pattern as the
+        main training loop to handle colocated reward model memory correctly.
+        """
+        from torch.utils.data import Subset
+        from torchdata.stateful_dataloader import StatefulDataLoader
+
+        n_rollouts = self.config.actor_rollout_ref.rollout.n
+
+        ref_dataset = Subset(self.train_dataset, ref_indices)
+        ref_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        ref_batch_size = min(ref_batch_size, len(ref_dataset))
+
+        ref_dataloader = StatefulDataLoader(
+            dataset=ref_dataset,
+            batch_size=ref_batch_size,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=self.collate_fn,
+        )
+
+        all_rewards = []
+        print(f"[DataSelection] Running reference rollouts on {len(ref_dataset)} samples "
+              f"({len(ref_dataloader)} batches, n={n_rollouts})...")
+
+        for batch_dict in ref_dataloader:
+            batch = DataProto.from_single_dict(batch_dict)
+            batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+            )
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+            gen_batch = self._get_gen_batch(batch)
+            gen_batch.meta_info["global_steps"] = self.global_steps
+
+            gen_batch_output = gen_batch.repeat(repeat_times=n_rollouts, interleave=True)
+            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+
+            # Sleep replicas to free GPU memory for reward computation
+            # (mirrors the training loop pattern for colocated RM)
+            self.checkpoint_manager.sleep_replicas()
+
+            batch = batch.repeat(repeat_times=n_rollouts, interleave=True)
+            batch = batch.union(gen_batch_output)
+
+            if "response_mask" not in batch.batch.keys():
+                batch.batch["response_mask"] = compute_response_mask(batch)
+
+            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                batch_reward = self._compute_reward_colocate(batch)
+                batch = batch.union(batch_reward)
+
+            reward_tensor, _ = extract_reward(batch)
+            rewards_per_sample = reward_tensor.sum(dim=-1).cpu().numpy()
+
+            uids = batch.non_tensor_batch["uid"]
+            unique_uids = np.unique(uids)
+            for uid in unique_uids:
+                uid_mask = uids == uid
+                uid_rewards = rewards_per_sample[uid_mask]
+                all_rewards.append(uid_rewards)
+
+            # Wake replicas back up for the next batch's generation
+            self.checkpoint_manager.update_weights()
+
+        if len(all_rewards) > 0:
+            max_len = max(len(r) for r in all_rewards)
+            padded = np.zeros((len(all_rewards), max_len), dtype=np.float32)
+            for i, r in enumerate(all_rewards):
+                padded[i, :len(r)] = r
+            return padded
+        return np.zeros((0, n_rollouts), dtype=np.float32)
+
+    def _rebuild_dataloader(self, indices: list):
+        """Rebuild the training dataloader with a subset of the dataset.
+
+        Uses the same StatefulDataLoader + RandomSampler pattern as the
+        original _create_dataloader to preserve checkpoint resumption.
+        """
+        from torch.utils.data import Subset
+        from torchdata.stateful_dataloader import StatefulDataLoader
+        from torchdata.stateful_dataloader.sampler import RandomSampler
+
+        subset = Subset(self.train_dataset, indices)
+        sampler = RandomSampler(data_source=subset)
+
+        self.train_dataloader = StatefulDataLoader(
+            dataset=subset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=self.config.data["dataloader_num_workers"],
+            drop_last=True,
+            collate_fn=self.collate_fn,
+            sampler=sampler,
+        )
+
+        print(f"[DataSelection] Rebuilt dataloader: {len(self.train_dataloader)} batches "
+              f"from {len(indices)}/{len(self.train_dataset)} samples")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1307,7 +1534,29 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            # --- Online data selection at epoch boundary (schedule=epoch only) ---
+            ds_metrics = self._maybe_reselect_data(epoch)
+            if ds_metrics:
+                logger.log(data=ds_metrics, step=self.global_steps)
+
+            # Manual iterator so schedule=step can rebuild the dataloader mid-epoch
+            # (a plain for-loop keeps the old iterator after rebuild).
+            dataloader_iter = iter(self.train_dataloader)
+            while True:
+                if (
+                    self._data_selection_active
+                    and self._data_selection_schedule == "step"
+                    and self._data_selection_initial_pending
+                ):
+                    ds_metrics = self._run_data_selection_round(trigger="step_initial")
+                    if ds_metrics:
+                        logger.log(data=ds_metrics, step=self.global_steps)
+                    self._data_selection_initial_pending = False
+                    dataloader_iter = iter(self.train_dataloader)
+                try:
+                    batch_dict = next(dataloader_iter)
+                except StopIteration:
+                    break
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1617,6 +1866,16 @@ class RayPPOTrainer:
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+                if (
+                    self._data_selection_active
+                    and self._data_selection_schedule == "step"
+                    and self.data_selector.should_reselect_step(self.global_steps)
+                ):
+                    ds_metrics = self._run_data_selection_round(trigger="step")
+                    if ds_metrics:
+                        logger.log(data=ds_metrics, step=self.global_steps)
+                    dataloader_iter = iter(self.train_dataloader)
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
