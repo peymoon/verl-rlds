@@ -27,6 +27,20 @@ class DataSelectionConfig:
     selection_budget: Optional[int] = None
     selection_budget_pct: float = 100.0
 
+    # Cumulative budget cap: limit total UNIQUE samples used across ALL
+    # selection rounds.  When set (not None), the selector will track every
+    # sample that has ever been selected and refuse to introduce new samples
+    # once the cumulative unique count reaches this percentage of the dataset.
+    # The per-round budget (selection_budget / selection_budget_pct) controls
+    # how many samples are used in each training window; this controls the
+    # global cap on unique samples across the entire training run.
+    # Example: selection_budget_pct=10, cumulative_budget_pct=10 → the first
+    # round picks the best 10%, then all subsequent rounds train on subsets
+    # of those same samples (no new data introduced).
+    # Example: selection_budget_pct=5, cumulative_budget_pct=10 → the pool
+    # grows across rounds up to 10%, with each round using 5%.
+    cumulative_budget_pct: Optional[float] = None
+
     cluster: dict = field(default_factory=dict)
     dots: dict = field(default_factory=dict)
 

@@ -134,6 +134,18 @@ data_selection:
   # Budget as percentage of full dataset (used when selection_budget is null)
   selection_budget_pct: 100.0
 
+  # Cumulative budget cap: limit total UNIQUE samples across ALL selection
+  # rounds to this percentage of the dataset.  When null (default), no cap is
+  # applied and cumulative unique usage can grow unboundedly across rounds.
+  # When set, the selector tracks every sample ever selected and stops
+  # introducing new samples once the cap is reached.  Subsequent rounds train
+  # on subsets of the already-selected pool.
+  # Example: selection_budget_pct=10, cumulative_budget_pct=10 → first round
+  # picks the best 10%, subsequent rounds re-use the same pool.
+  # Example: selection_budget_pct=5, cumulative_budget_pct=10 → pool grows
+  # across rounds up to 10%, each round uses 5%.
+  cumulative_budget_pct: null
+
   # Cluster-specific settings (used when method=cluster)
   cluster:
 

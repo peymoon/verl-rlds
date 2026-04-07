@@ -166,6 +166,7 @@ class ClusterSelector(DataSelector):
         self._selection_jaccard: float = 0.0
         self._selection_history: List[set] = []  # all rounds' NPZ index sets
         self._per_cluster_coverage: Dict[int, int] = {}  # cluster_id -> times selected
+        self._ever_selected_set: set = set()  # NPZ indices ever selected (for cumulative cap)
 
         # --- Exploration rollouts ---
         self._exploration_indices: List[int] = []  # NPZ indices for next exploration
@@ -894,6 +895,9 @@ class ClusterSelector(DataSelector):
         else:
             raise ValueError(f"Unknown cluster selection strategy: {strategy}")
 
+        # --- Enforce cumulative budget cap ---
+        npz_indices = self._enforce_cumulative_cap(npz_indices, budget)
+
         # --- Selection overlap tracking ---
         current_set = set(npz_indices)
         if self._prev_selected_set:
@@ -905,19 +909,19 @@ class ClusterSelector(DataSelector):
         self._prev_selected_set = current_set
         self._selection_history.append(current_set)
 
+        # Update ever-selected set
+        self._ever_selected_set |= current_set
+
         # Track per-cluster selection frequency
         for idx in npz_indices:
             c_id = int(self._cluster_ids[idx])
             self._per_cluster_coverage[c_id] = self._per_cluster_coverage.get(c_id, 0) + 1
 
-        # Count how many unique samples have EVER been selected across all rounds
-        all_ever_selected = set()
-        for s in self._selection_history:
-            all_ever_selected |= s
-        coverage_pct = 100.0 * len(all_ever_selected) / max(len(self._embeddings), 1)
+        # Cumulative coverage stats
+        coverage_pct = 100.0 * len(self._ever_selected_set) / max(len(self._embeddings), 1)
 
         print(f"[ClusterSelector] Overlap: jaccard={self._selection_jaccard:.3f}, "
-              f"cumulative_coverage={coverage_pct:.1f}% ({len(all_ever_selected)}/{len(self._embeddings)})")
+              f"cumulative_coverage={coverage_pct:.1f}% ({len(self._ever_selected_set)}/{len(self._embeddings)})")
 
         # Remap NPZ positions → parquet positions so the trainer's
         # Subset(train_dataset, indices) accesses the correct rows.
@@ -927,6 +931,67 @@ class ClusterSelector(DataSelector):
         print(f"[ClusterSelector] Selected {len(indices)} samples "
               f"(strategy={strategy}, budget={budget})")
         return indices
+
+    def _enforce_cumulative_cap(self, npz_indices: List[int], budget: int) -> List[int]:
+        """Enforce the cumulative budget cap on unique samples across all rounds.
+
+        If cumulative_budget_pct is not set, returns npz_indices unchanged.
+        Otherwise, limits the number of never-before-seen samples so that
+        the total unique samples ever selected does not exceed the cap.
+        When new sample slots are exhausted, backfills from the previously-
+        selected pool to maintain the per-round budget.
+        """
+        cum_pct = self.config.cumulative_budget_pct
+        if cum_pct is None:
+            return npz_indices
+
+        cumulative_budget = max(1, int(len(self._embeddings) * cum_pct / 100.0))
+        remaining_new_slots = max(0, cumulative_budget - len(self._ever_selected_set))
+
+        proposed_set = set(npz_indices)
+        old_samples = [idx for idx in npz_indices if idx in self._ever_selected_set]
+        new_samples = [idx for idx in npz_indices if idx not in self._ever_selected_set]
+
+        n_new_proposed = len(new_samples)
+
+        if n_new_proposed <= remaining_new_slots:
+            # All new samples fit within the cap — no change needed.
+            if n_new_proposed > 0:
+                print(f"[ClusterSelector] Cumulative cap: {n_new_proposed} new samples "
+                      f"within budget ({remaining_new_slots} slots remaining of {cumulative_budget})")
+            return npz_indices
+
+        # Too many new samples — keep only remaining_new_slots of them.
+        # Strategy functions tend to put higher-priority samples first, so
+        # we preserve order (take the first remaining_new_slots new ones).
+        allowed_new = new_samples[:remaining_new_slots]
+        n_dropped = n_new_proposed - remaining_new_slots
+
+        # Backfill: need (budget - len(old_samples) - len(allowed_new)) more
+        # samples from the ever-selected pool that aren't already in old_samples.
+        n_have = len(old_samples) + len(allowed_new)
+        n_need = min(budget, n_have + len(self._ever_selected_set)) - n_have
+
+        backfill = []
+        if n_need > 0:
+            # Pool of previously-selected samples not already in this round.
+            already_in_round = set(old_samples) | set(allowed_new)
+            available_pool = list(self._ever_selected_set - already_in_round)
+
+            if available_pool:
+                n_backfill = min(n_need, len(available_pool))
+                # Pick backfill samples randomly from the available pool.
+                backfill_idx = self._rng.choice(
+                    len(available_pool), size=n_backfill, replace=False
+                )
+                backfill = [available_pool[i] for i in backfill_idx]
+
+        result = old_samples + allowed_new + backfill
+        print(f"[ClusterSelector] Cumulative cap enforced: "
+              f"kept {len(old_samples)} old + {len(allowed_new)} new "
+              f"(dropped {n_dropped}) + {len(backfill)} backfill = {len(result)} total "
+              f"(cumulative unique: {len(self._ever_selected_set) + len(allowed_new)}/{cumulative_budget})")
+        return result
 
     def _select_top_clusters(self, budget: int) -> List[int]:
         """Greedily include all samples from highest-variance clusters."""
@@ -1323,15 +1388,21 @@ class ClusterSelector(DataSelector):
 
         # --- Selection overlap metrics ---
         metrics["data_selection/overlap_jaccard"] = self._selection_jaccard
-        if self._selection_history:
-            all_ever = set()
-            for s in self._selection_history:
-                all_ever |= s
+        if self._ever_selected_set:
             metrics["data_selection/cumulative_coverage_pct"] = (
-                100.0 * len(all_ever) / max(len(self._embeddings), 1)
+                100.0 * len(self._ever_selected_set) / max(len(self._embeddings), 1)
             )
-            metrics["data_selection/cumulative_unique_selected"] = float(len(all_ever))
+            metrics["data_selection/cumulative_unique_selected"] = float(len(self._ever_selected_set))
             metrics["data_selection/selection_round"] = float(self._selection_round)
+
+            # Report cumulative budget cap utilization if enabled
+            cum_pct = self.config.cumulative_budget_pct
+            if cum_pct is not None:
+                cumulative_budget = max(1, int(len(self._embeddings) * cum_pct / 100.0))
+                metrics["data_selection/cumulative_budget"] = float(cumulative_budget)
+                metrics["data_selection/cumulative_budget_utilization_pct"] = (
+                    100.0 * len(self._ever_selected_set) / cumulative_budget
+                )
 
         # Per-cluster selection frequency stats (how evenly distributed is selection?)
         if self._per_cluster_coverage:

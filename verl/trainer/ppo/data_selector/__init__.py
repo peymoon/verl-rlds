@@ -75,6 +75,7 @@ def _to_ds_config(config) -> DataSelectionConfig:
             "reselect_interval",
             "selection_budget",
             "selection_budget_pct",
+            "cumulative_budget_pct",
             "cluster",
             "dots",
         ):
