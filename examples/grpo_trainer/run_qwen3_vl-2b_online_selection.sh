@@ -5,18 +5,100 @@ set -x
 # Key differences from the standard run script:
 #   1. data.train_files points to the FULL dataset (not a pre-selected subset)
 #   2. data_selection.method=cluster enables online cluster-based selection
-#   3. data_selection.selection_budget_pct=20.0 selects top 20% each epoch
+#   3. data_selection.selection_budget_pct=10.0 selects top 10% each step
 #   4. data_selection.cluster.cluster_arrays_file points to pre-computed clusters
-#   5. trainer.total_epochs is increased since each epoch trains on 20% of data
+#      (outputs_300_cluster_new/cluster_arrays.npz from Stage 1)
+#   5. data_selection.cluster.dataset_json_file points to the JSON used to build
+#      the embeddings — required for correct NPZ↔parquet index alignment
+#   6. trainer.total_epochs is increased since each epoch trains on 10% of data
 #
-# For reselection every N *steps* instead of every epoch:
-#   data_selection.reselect_schedule=step data_selection.reselect_interval=10
+# Arguments:
+#   ENGINE          vllm or sglang (default: vllm)
+#   CLUSTER_ARRAYS  path to cluster_arrays.npz
+#                   (default: outputs_300_cluster_new/cluster_arrays.npz)
+#   VARIANT         interpolated_weighted (default) or interpolated
+#   DATASET_JSON    path to the JSON/JSONL used to build the cluster embeddings
+#                   REQUIRED for correct NPZ↔parquet row alignment.
+#                   Without this, REPR rollouts and select() reference wrong parquet rows.
+#                   (default: VLAA-Thinking-GRPO-25K_train_90_100.json)
 #
-# Pre-requisite: run the offline cluster pipeline (stages 0-1) to get cluster_arrays.npz
-# See cluster_selection/README.md for instructions.
+# Variants:
+#   interpolated_weighted  strategy=interpolated + dots_diversity=true
+#                          + dots_diversity_use_composite_score=true
+#                          + use_rollout_history=true
+#                          Cluster allocation weighted by var×transferability×(1/density).
+#                          Training-batch rollouts accumulate with time-decay into the
+#                          DOTS reference set, growing from ~250 REPR rollouts to up to
+#                          2000 diverse samples mid-training.
+#   interpolated           strategy=interpolated + dots_diversity=true
+#                          Fixed REPR medoids only (K=50 x n_reps=5 = 250 refs),
+#                          no composite score. Use as ablation against
+#                          interpolated_weighted to isolate the benefit of the
+#                          rollout history buffer and composite scoring.
+#
+# Reselection cadence:
+#   data_selection.reselect_schedule=step   → triggers every N training steps
+#   data_selection.reselect_interval=10     → re-select every 10 steps
+#   Cost: reference rollouts on 250 medoids at each round. Increase interval
+#   if rollouts are expensive.
+#
+# Pre-requisite: run the offline cluster pipeline (stages 0-1) to produce
+#   cluster_arrays.npz. See cluster_selection/README.md for instructions.
+#
+# Usage examples:
+#   # Default: interpolated + time-weighted rollout history buffer
+#   bash run_qwen3_vl-2b_online_selection.sh
+#
+#   # Explicit defaults:
+#   bash run_qwen3_vl-2b_online_selection.sh vllm /path/to/cluster_arrays.npz interpolated_weighted /path/to/dataset.json
+#
+#   # Without history buffer (baseline comparison):
+#   bash run_qwen3_vl-2b_online_selection.sh vllm /path/to/cluster_arrays.npz interpolated /path/to/dataset.json
+#
+#   # Override CUDA devices:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash run_qwen3_vl-2b_online_selection.sh
+#
+#   # Pass extra Hydra overrides (appended after all positional params):
+#   bash run_qwen3_vl-2b_online_selection.sh vllm /path/cluster.npz interpolated_weighted /path/dataset.json \
+#       data_selection.cluster.rollout_history_decay_rate=0.1 \
+#       trainer.total_epochs=20
 
 ENGINE=${1:-vllm}
-CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection//benchmark/rl_data_selection/cluster_selection/outputs_200_cluster/cluster_arrays.npz}
+CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz}
+VARIANT=${3:-interpolated_weighted}
+# Path to the JSON/JSONL that was used to build the cluster embeddings.
+# Required to correctly align NPZ row order with parquet row order — these
+# two orderings are typically different.  The selector uses this to remap
+# NPZ indices → parquet indices for REPR rollouts, select(), and history buffer.
+DATASET_JSON=${4:-/workspace/rl_data_selection/data/VLAA-Thinking/VLAA-Thinking-GRPO-25K_train_90_100.json}
+shift 4 || true
+
+# --- Variant-specific flags ---
+if [ "$VARIANT" = "interpolated_weighted" ]; then
+    # Interpolated strategy + diversity floor + composite cluster scoring
+    # + time-weighted rollout history buffer.
+    # Cluster allocation weighted by mean_predicted_var × transferability × (1/density).
+    # The buffer seeds from REPR medoid rollouts and grows organically with each
+    # training batch, giving DOTS an increasingly rich, policy-tracking reference set.
+    USE_ROLLOUT_HISTORY=true
+    DOTS_DIVERSITY=true
+    DOTS_COMPOSITE=true
+    EXP_SUFFIX="interpolated_weighted"
+elif [ "$VARIANT" = "interpolated" ]; then
+    # Interpolated strategy + diversity floor, fixed REPR medoids only, no composite score.
+    # Use as an ablation against interpolated_weighted to isolate the benefit
+    # of the rollout history buffer and composite scoring.
+    USE_ROLLOUT_HISTORY=false
+    DOTS_DIVERSITY=true
+    DOTS_COMPOSITE=false
+    EXP_SUFFIX="interpolated_centroid"
+else
+    echo "ERROR: Unknown VARIANT='$VARIANT'. Valid values: interpolated_weighted, interpolated"
+    exit 1
+fi
+
+EXP_NAME="fixed2_k50_r10_top10pct_cluster_online_10pct_${EXP_SUFFIX}"
+EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"3,4,5,7"} \
 python3 -m verl.trainer.main_ppo \
@@ -34,11 +116,26 @@ python3 -m verl.trainer.main_ppo \
     data_selection.reselect_interval=10 \
     data_selection.selection_budget_pct=10.0 \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
-    data_selection.cluster.n_clusters=200 \
-    data_selection.cluster.n_reps=3 \
+    data_selection.cluster.dataset_json_file=$DATASET_JSON \
+    data_selection.cluster.n_clusters=50 \
+    data_selection.cluster.n_reps=10 \
     data_selection.cluster.strategy=interpolated \
     data_selection.cluster.within_cluster_method=centroid_nearest \
     data_selection.cluster.representative_method=medoid \
+    data_selection.cluster.dots_temperature=0.05 \
+    data_selection.cluster.dots_top_k=64 \
+    data_selection.cluster.dots_diversity=$DOTS_DIVERSITY \
+    data_selection.cluster.dots_diversity_use_composite_score=$DOTS_COMPOSITE \
+    data_selection.cluster.use_rollout_history=$USE_ROLLOUT_HISTORY \
+    data_selection.cluster.rollout_history_decay_rate=0.05 \
+    data_selection.cluster.rollout_history_max_age=500 \
+    data_selection.cluster.rollout_history_max_refs=2000 \
+    data_selection.cluster.exploration_enabled=true \
+    data_selection.cluster.exploration_pct=5.0 \
+    data_selection.cluster.exploration_pct_base=$EXPLORATION_PCT_BASE \
+    data_selection.cluster.exploration_interval=2 \
+    data_selection.cluster.igs_enabled=false \
+    data_selection.cluster.igs_weight=1.0 \
     actor_rollout_ref.model.path=Qwen/Qwen3-VL-2B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -67,14 +164,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_vlaa_grpo_full' \
-    trainer.experiment_name='selected_k200_r3_interpolated_centroid_top10pct_cluster_online_10pct_qwen3_vl_2b' \
+    trainer.experiment_name="${EXP_NAME}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=3 \
     trainer.total_epochs=10 \
-    trainer.default_local_dir=/workspace/peyman/outputs/checkpoints/online_selection/selected_k200_r3_interpolated_centroid_top10pct_cluster_online_10pct \
+    trainer.default_local_dir=/workspace/rl_data_selection/peyman/outputs/checkpoints/online_selection/${EXP_NAME} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    trainer.rollout_data_dir=/workspace/peyman/outputs/rollouts/online_selection/selected_k200_r3_interpolated_centroid_top10pct_cluster_online_10pct \
+    trainer.rollout_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME} \
     trainer.val_before_train=False \
-    trainer.validation_data_dir=/workspace/peyman/outputs/rollouts/online_selection/selected_k200_r3_interpolated_centroid_top10pct_cluster_online_10pct_val "$@"
+    trainer.validation_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME}_val "$@"

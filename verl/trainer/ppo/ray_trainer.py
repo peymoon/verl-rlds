@@ -498,6 +498,16 @@ class RayPPOTrainer:
             metrics["data_selection/n_ref_samples"] = len(ref_indices)
             metrics["data_selection/ref_reward_mean"] = float(ref_rewards.mean())
 
+        # --- Exploration rollouts (break feedback loop) ---
+        if hasattr(self.data_selector, "get_exploration_indices"):
+            explore_indices = self.data_selector.get_exploration_indices()
+            if len(explore_indices) > 0:
+                print(f"[DataSelection] Running exploration rollouts on {len(explore_indices)} samples...")
+                explore_rewards = self._run_reference_rollouts(explore_indices)
+                self.data_selector.update_exploration_rewards(explore_indices, explore_rewards)
+                metrics["data_selection/n_exploration_samples"] = len(explore_indices)
+                metrics["data_selection/exploration_reward_mean"] = float(explore_rewards.mean())
+
         budget = self.data_selector.get_selection_budget(len(self.train_dataset))
         selected_indices = self.data_selector.select(budget)
 
@@ -509,6 +519,18 @@ class RayPPOTrainer:
             )
 
         metrics.update(self.data_selector.get_metrics())
+
+        # Generate wandb image visualizations if the selector supports it
+        if hasattr(self.data_selector, "get_wandb_images"):
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb_images = self.data_selector.get_wandb_images()
+                    if wandb_images:
+                        wandb.log(wandb_images, step=self.global_steps)
+            except (ImportError, Exception):
+                pass  # wandb not available or not active; skip silently
+
         return metrics
 
     def _run_reference_rollouts(self, ref_indices: list) -> np.ndarray:
@@ -717,7 +739,10 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # "dataset_idx" is kept in batch (not popped into gen_batch) so that
+        # after batch.repeat(n_rollouts) it is present in the training batch
+        # and can be forwarded to update_rollout_history().
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "dataset_idx"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -1656,6 +1681,20 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                        # Feed training rollouts into the data selector's history
+                        # buffer so they can serve as additional DOTS reference
+                        # points alongside the fixed REPR medoid rollouts.
+                        if (
+                            self._data_selection_active
+                            and hasattr(self.data_selector, "update_rollout_history")
+                        ):
+                            self.data_selector.update_rollout_history(
+                                step=self.global_steps,
+                                uids=batch.non_tensor_batch["uid"],
+                                rewards_per_rollout=reward_tensor.sum(dim=-1).cpu().numpy(),
+                                dataset_indices=batch.non_tensor_batch.get("dataset_idx"),
+                            )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

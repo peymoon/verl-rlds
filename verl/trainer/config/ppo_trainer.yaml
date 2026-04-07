@@ -164,6 +164,25 @@ data_selection:
     # Number of nearest references for DOTS interpolation
     dots_top_k: 64
 
+    # --- dots_diversity: per-cluster allocation for the interpolated strategy ---
+    # False: global top-k by predicted variance (default)
+    # True: allocate budget per cluster (min 1 each), take top-n within each cluster
+    dots_diversity: false
+
+    # When dots_diversity=True, weight cluster allocation by
+    # mean_predicted_var × transferability × (1/density) instead of variance alone.
+    dots_diversity_use_composite_score: false
+
+    # Softmax temperature for cluster allocation (dots_diversity=True).
+    # High (~1.0) → near-uniform; Low (~0.05) → concentrated on top clusters.
+    dots_diversity_temperature: 0.1
+
+    # When true, anneal dots_diversity_temperature from _start → _end over training.
+    dots_diversity_anneal: false
+    dots_diversity_temperature_start: 1.0
+    dots_diversity_temperature_end: 0.05
+    dots_diversity_temperature_decay: 0.1
+
     # Softmax temperature for composite score budget allocation
     score_temperature: 0.1
 
@@ -173,6 +192,41 @@ data_selection:
     # Gaussian kernel bandwidth for density and MMD
     density_gamma: 1.0
     mmd_gamma: 1.0
+
+    # --- Time-weighted rollout history buffer (interpolated strategy only) ---
+    # When true, training-batch rollouts accumulate into a rolling buffer and
+    # are used as additional DOTS reference points alongside REPR medoids.
+    # Variance estimates are weighted by recency: w(t) = exp(-λ × Δstep).
+    use_rollout_history: false
+    rollout_history_decay_rate: 0.05   # λ: higher = faster decay of old observations
+    rollout_history_max_age: 500       # discard entries older than this many steps
+    rollout_history_max_refs: 2000     # cap reference set size passed to DOTS
+
+    # --- Exploration rollouts ---
+    # Periodically include a small random subset of unselected samples to
+    # diversify the rollout history buffer and avoid selector feedback loops.
+    exploration_enabled: false
+    exploration_pct: 5.0
+    # Base used by exploration_pct:
+    #   dataset         -> percent of full dataset size (backward-compatible)
+    #   representatives -> percent of reference-set size (n_clusters * n_reps)
+    exploration_pct_base: dataset
+    exploration_interval: 1
+
+    # --- Image Grounding Score (IGS) ---
+    # Optional multiplier in composite scoring to favor genuinely multimodal
+    # samples (where image materially affects reward variance).
+    igs_enabled: false
+    igs_weight: 1.0
+
+    # Path to the JSON/JSONL used to build the cluster embeddings (e.g.
+    # VLAA-Thinking-GRPO-25K_train_90_100.json).  REQUIRED when the NPZ was
+    # built from this file and the training parquet has a different row ordering
+    # (which is the common case — the two pipelines produce independent orderings).
+    # Used to build a bidirectional NPZ↔parquet index map at startup so that
+    # REPR rollouts and select() reference the correct parquet rows.
+    # Without this, selection is silently wrong (random-equivalent).
+    dataset_json_file: null
 
   # DOTS-specific settings (used when method=dots)
   dots:

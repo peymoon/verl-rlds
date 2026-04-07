@@ -366,6 +366,14 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        # Pass the original full-dataset integer index through the batch so the
+        # cluster data selector can map training-batch rollouts back to their
+        # dataset positions in the rollout history buffer.  When this dataset is
+        # wrapped by torch.utils.data.Subset (as happens after each online
+        # reselection), Subset.__getitem__ maps the subset position back to the
+        # original index before calling here, so `item` is always the global
+        # full-dataset position.
+        row_dict["dataset_idx"] = item
         return row_dict
 
     @classmethod

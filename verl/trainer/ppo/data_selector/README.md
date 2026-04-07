@@ -89,6 +89,23 @@ Every `data_selection.*` key in the bash script maps directly to a config field.
 | `data_selection.cluster.density_gamma` | `1.0` | `cluster_selector.py: _compute_static_scores()` | Gaussian kernel bandwidth for density computation |
 | `data_selection.cluster.dots_temperature` | `0.05` | `cluster_selector.py: _dots_interpolate()` | Softmax temperature for interpolated strategy only |
 | `data_selection.cluster.dots_top_k` | `64` | `cluster_selector.py: _dots_interpolate()` | Neighbours used for per-sample variance prediction in interpolated strategy |
+| `data_selection.cluster.dots_diversity` | `False` | `cluster_selector.py: _select_interpolated()` | When `True`, allocates budget per cluster (softmax over cluster scores, min 1 per cluster) then takes top-n within each cluster by predicted variance. When `False`, pure global top-k. |
+| `data_selection.cluster.dots_diversity_use_composite_score` | `False` | `cluster_selector.py: _select_interpolated()` | When `True` (requires `dots_diversity=True`), weights cluster allocation by `mean_predicted_var × transferability × (1/density)` instead of predicted variance alone. Penalises tight redundant clusters and rewards transferable ones. |
+| `data_selection.cluster.dots_diversity_temperature` | `0.1` | `cluster_selector.py: _select_interpolated()` | Softmax temperature for cluster allocation when `dots_diversity=True`. High (1.0) → near-uniform. Low (0.01) → only top clusters get budget. |
+| `data_selection.cluster.dots_diversity_anneal` | `False` | `cluster_selector.py: _select_interpolated()` | When `True`, decays `dots_diversity_temperature` exponentially over selection rounds. |
+| `data_selection.cluster.dots_diversity_temperature_start` | `1.0` | `cluster_selector.py: _select_interpolated()` | Starting temperature when annealing is enabled (hot = near-uniform allocation). |
+| `data_selection.cluster.dots_diversity_temperature_end` | `0.05` | `cluster_selector.py: _select_interpolated()` | Minimum temperature when annealing is enabled (cold = concentrated allocation). |
+| `data_selection.cluster.dots_diversity_temperature_decay` | `0.1` | `cluster_selector.py: _select_interpolated()` | Exponential decay rate per selection round: `temp(t) = end + (start−end) × exp(−decay × t)`. |
+| `data_selection.cluster.use_rollout_history` | `False` | `cluster_selector.py: update_rollout_history()` | When `True`, training-batch rollouts are accumulated into a time-weighted buffer and used as additional DOTS reference points alongside REPR medoids. See below. |
+| `data_selection.cluster.rollout_history_decay_rate` | `0.05` | `cluster_selector.py: _compute_time_weighted_variances()` | λ in `exp(-λ * Δstep)`. Higher = faster decay of old observations. |
+| `data_selection.cluster.rollout_history_max_age` | `500` | `cluster_selector.py: update_rollout_history()` | Entries older than this many training steps are discarded from the buffer. |
+| `data_selection.cluster.rollout_history_max_refs` | `2000` | `cluster_selector.py: _compute_time_weighted_variances()` | Maximum number of reference points passed to DOTS (keeps most recent). |
+| `data_selection.cluster.dataset_json_file` | `None` | `cluster_selector.py: _build_alignment_from_json()` | **Required when NPZ and parquet have different row orderings.** Path to the JSON/JSONL used to build the cluster embeddings. The selector matches by `image` field to produce a bidirectional NPZ↔parquet index map. Without this, REPR rollouts and `select()` reference wrong parquet rows (silently incorrect selection). |
+| `data_selection.cluster.exploration_enabled` | `false` | `cluster_selector.py: get_exploration_indices()` | Enable exploration rollouts on random un-selected samples to break feedback loops |
+| `data_selection.cluster.exploration_pct` | `5.0` | `cluster_selector.py: get_selection_budget_for_exploration()` | Percentage of full dataset to explore each round |
+| `data_selection.cluster.exploration_interval` | `1` | `cluster_selector.py: get_exploration_indices()` | Explore every N selection rounds |
+| `data_selection.cluster.igs_enabled` | `false` | `cluster_selector.py: _select_interpolated()` | Enable Image Grounding Score in composite cluster scoring |
+| `data_selection.cluster.igs_weight` | `1.0` | `cluster_selector.py: _select_interpolated()` | Exponent on IGS in composite score. Higher = stronger preference for multimodal clusters |
 
 > **Note on experiment names**: The WandB `experiment_name` string (e.g. `"…interpolated_centroid…"`) is just a human label — it does **not** control any algorithm. The actual strategy is set by `data_selection.cluster.strategy`. Double-check the strategy param, not the experiment name.
 
@@ -169,11 +186,169 @@ Uses embedding geometry and cluster structure for selection. This is the main co
 
   Budget allocated via softmax over scores — `score_temperature=0.1` gives a relatively sharp distribution (a few clusters dominate but none monopolises). Corresponds to the COINCIDE algorithm.
 
-- **`interpolated`**: Works at per-sample granularity instead of per-cluster. For every sample in the full dataset, predicts its variance by embedding-similarity-weighted average of the representative rollout variances:
+- **`interpolated`**: Works at per-sample granularity instead of per-cluster. For every sample in the full dataset, predicts its variance by embedding-similarity-weighted average of the **individual** representative rollout variances (not cluster averages):
   ```
   predicted_var[i] = Σ softmax(cosine_sim(emb[i], rep_embs) / dots_temperature) × rep_variances
   ```
-  Then returns the globally top-budget samples. Not constrained to cluster boundaries. The offline `04_select_samples.py --strategy interpolated` does the same thing but with pre-computed static variances; the online version re-runs this with the current policy's variances each round. Expensive: requires a full-dataset embedding pass per selection round.
+  Supports two final selection modes controlled by `dots_diversity`:
+
+  | `dots_diversity` | Behaviour | Risk |
+  |---|---|---|
+  | `False` (default) | Global top-k: return the `budget` samples with highest predicted variance | May concentrate all selections in one high-variance region |
+  | `True` | Per-cluster softmax allocation (min 1 per cluster), then top-n within each cluster by predicted variance | Guarantees coverage; trades some variance focus for diversity |
+
+  When `dots_diversity=True`, three additional knobs control the allocation:
+
+  - **`dots_diversity_use_composite_score`** — instead of allocating proportional to mean predicted variance, weight each cluster by `mean_predicted_var × transferability × (1/density)`. This penalises tight redundant clusters and rewards clusters whose learned skills transfer broadly. Requires `_compute_static_scores()` which runs automatically for the `interpolated` strategy.
+
+  - **`dots_diversity_temperature`** — softmax temperature over cluster scores. High (e.g. 1.0) gives near-uniform allocation (diverse, like random). Low (e.g. 0.05) concentrates budget on top-scoring clusters. Default 0.1 is a moderate focus.
+
+  - **`dots_diversity_anneal`** — when enabled, temperature decays exponentially from `dots_diversity_temperature_start` to `dots_diversity_temperature_end` at rate `dots_diversity_temperature_decay` per selection round:
+    ```
+    temp(t) = temp_end + (temp_start - temp_end) × exp(-decay × t)
+    ```
+    Intuition: start warm (diverse exploration early in training) and cool down as the model's learning frontier becomes clearer.
+
+  Expensive: requires a full-dataset embedding pass per selection round. The offline `04_select_samples.py --strategy interpolated` is the same algorithm with pre-computed static variances.
+
+#### Time-weighted rollout history buffer (`use_rollout_history`)
+
+By default, `interpolated` (and all other strategies) use only the **REPR medoids** as reference points — K×n_reps samples (e.g. 50×5=250). These are structurally spread but their variance signal is limited to a small, fixed probe set.
+
+When `use_rollout_history=True`, every training batch's rollouts are also accumulated into a **rolling buffer** alongside the REPR rollouts. The effective variance for each buffered sample is computed with exponential time-weighting:
+
+```
+w(t) = exp(-λ × (current_step - t))
+effective_var[uid] = Σ_t w(t) × var(rewards_at_step_t) / Σ_t w(t)
+```
+
+This means:
+- **Recent rollouts count most** — rewards from 10 steps ago have more weight than rewards from 100 steps ago
+- **Old observations decay** — entries older than `rollout_history_max_age` steps are discarded entirely
+- **The reference set grows organically** — from K×n_reps REPR medoids at the start to up to `rollout_history_max_refs` (default 2000) distinct samples by mid-training
+- **Seeded automatically** — the REPR rollouts from each selection round are always added to the buffer so the buffer is never empty
+
+**Timeline of buffer growth (with fix applied — see bug note below):**
+
+| Training step | Buffer size | Source |
+|---|---|---|
+| 0 (first selection) | K×n_reps (e.g. 600) | REPR rollouts only |
+| 10 | ~730 (600 + ~2 batches×64) | + first training batches |
+| 50 | ~1500 | + more batches, old entries start decaying |
+| 100+ | ~2000 (capped) | Most-recent 2000 samples, oldest pruned |
+
+> **Note:** If `n_clusters × n_reps ≥ rollout_history_max_refs` (e.g. 300×10=3000 ≥ 2000), the buffer is already at capacity from REPR alone. Training-batch rollouts would be immediately evicted, so the buffer stays locked to the most-recent REPR medoids. In this case the bug below has no impact.
+
+**When to use it:**
+- When `n_clusters × n_reps < rollout_history_max_refs` (i.e. the REPR medoids alone don't fill the buffer) and you want broader coverage of the embedding space as a DOTS reference set
+- When you want variance estimates to track the *current* policy's capabilities across the training distribution, not just at medoid locations
+- Most beneficial after the first 20–50 training steps when the buffer has enough diversity
+
+**Recommended settings for a first run:**
+```yaml
+use_rollout_history: true
+rollout_history_decay_rate: 0.05    # half-life ≈ 14 steps; tune up for faster adaptation
+rollout_history_max_age: 500        # discard entries >500 steps old
+rollout_history_max_refs: 2000      # cap reference set size (controls DOTS cost)
+```
+
+**Important:** `use_rollout_history` requires `strategy: interpolated` — the other strategies (scored, weighted, top_clusters) don't use per-sample DOTS interpolation and won't benefit from the buffer.
+
+---
+
+#### Bug fix: training-batch rollouts not accumulating in history buffer
+
+**Symptom (prior to fix):** With `use_rollout_history=True` and `n_reps` small enough that REPR medoids don't fill the buffer (e.g. k=300, n_reps=2 → 599 medoids < 2000 max_refs), the `DOTS reference: N samples` log line was stuck at exactly the REPR medoid count across all training rounds instead of growing toward `max_refs`. Zero-variance cluster counts were very high (40–130/300) compared to runs where the buffer was full.
+
+**Root cause:** The training loop assigned random `uuid4()` session IDs to each batch (`batch.non_tensor_batch["uid"]`). The `update_rollout_history()` method tried to map these session IDs back to dataset positions via `_uid_to_dataset_idx`, which is keyed on image-path strings like `clevr_math-CLEVR_train_026670.png`. Every lookup returned `None` and was silently dropped — no training-batch rollout ever entered the buffer.
+
+No warning was printed because `_uid_to_dataset_idx` was non-empty (it contained the NPZ UIDs); the early-exit guard only fires when the map is completely absent.
+
+**Fix (applied):** Three files changed:
+
+1. **`verl/utils/dataset/rl_dataset.py`** — `__getitem__` now emits `row_dict["dataset_idx"] = item`, the integer full-dataset index. `torch.utils.data.Subset` maps subset positions to original indices before calling `__getitem__`, so `item` is always the global position even after a reselection rebuild.
+
+2. **`verl/trainer/ppo/ray_trainer.py`** — the `update_rollout_history` call now passes `dataset_indices=batch.non_tensor_batch.get("dataset_idx")`.
+
+3. **`verl/trainer/ppo/data_selector/cluster_selector.py`** — `update_rollout_history` accepts the new `dataset_indices` parameter. When provided, it uses direct integer index lookups (fast path). The legacy string-UID path is kept as fallback. Each call now prints a diagnostic line:
+   ```
+   [ClusterSelector] update_rollout_history step=N: matched X/Y samples, buffer_unique=Z
+   ```
+   After the fix, `matched X/Y` should be `128/128` (or whatever the batch size is) every step, and `buffer_unique` should grow each step until it reaches `max_refs`.
+
+**How to verify the fix is working:** Check for these log patterns:
+```
+# BEFORE fix (broken):
+[ClusterSelector] DOTS reference: 599 samples from rollout history (step=139)
+#                                 ^^^ frozen at REPR count, never grows
+
+# AFTER fix (working):
+[ClusterSelector] update_rollout_history step=1: matched 128/128 samples, buffer_unique=727
+[ClusterSelector] update_rollout_history step=2: matched 128/128 samples, buffer_unique=855
+...
+[ClusterSelector] DOTS reference: 1823 samples from rollout history (step=9)
+#                                 ^^^^ growing toward max_refs=2000
+```
+
+WandB metrics to watch:
+- `data_selection/history_buffer_unique` — should rise from REPR count toward `max_refs`
+- `data_selection/history_buffer_total_entries` — counts all temporal entries across all samples
+
+---
+
+---
+
+#### Bug fix: NPZ row order ≠ parquet row order (silent wrong selection)
+
+**Symptom (prior to fix):** Online selection produced results indistinguishable from random or full-dataset training despite the cluster pipeline appearing to "work" (logs showing variance measurements, zero-variance cluster counts, DOTS references). The cluster selector was running but selecting wrong samples because its internal NPZ positions were being used directly as parquet positions.
+
+**Root cause:** `cluster_arrays.npz` is built from a JSON/JSONL file (e.g. `VLAA-Thinking-GRPO-25K_train_90_100.json`) using the offline `00_compute_embeddings.py` + `01_cluster.py` pipeline. The training parquet (`train_90_100.parquet`) is produced by a separate conversion pipeline. These two pipelines produce the **same 22,675 samples but in completely different row orderings** — there is zero positional correspondence between them.
+
+The original code used NPZ row indices everywhere — as REPR parquet indices in `get_reference_indices()`, as selection output in `select()`, and as buffer keys in `update_rollout_history()`. Using an NPZ row 7 as "parquet row 7" picks a completely unrelated sample, making all selection effectively random.
+
+A spot-check confirmed zero positional matches between the two orderings. Matching by `image` path (the field present in both the JSON and in `extra_info['image']` of each parquet row) gives 100% alignment (22,675/22,675 matched).
+
+**Why the logs appeared healthy despite wrong selection:** The variance measurement and DOTS interpolation still ran correctly *relative to the NPZ order* — there were genuine zero-variance clusters, growing reference counts, and score computations. But the final output indices were NPZ positions fed to `torch.utils.data.Subset`, which treated them as parquet positions. The training was effectively random-sampling the parquet.
+
+**Fix (applied):** One new config field and three code changes:
+
+1. **`data_selection.cluster.dataset_json_file`** — path to the JSON/JSONL that was used to build the cluster embeddings. Set this in the launch script (or YAML config).
+
+2. **`cluster_selector.py: _build_alignment_from_json()`** — called during `initialize()`. Loads the JSON, reads `image` fields, then walks the parquet dataset to extract `extra_info['image']`. Builds two maps:
+   - `_npz_to_dataset[npz_i] = parquet_i` (shape N_npz, -1 for unmatched)
+   - `_dataset_to_npz[parquet_i] = npz_i` (dict, only for matched rows)
+
+3. **`get_reference_indices()`** — now calls `_remap_npz_to_dataset(self._rep_indices)` so REPR rollouts target the correct parquet rows.
+
+4. **`select()`** — all strategy implementations return NPZ indices; the final `_remap_npz_to_dataset()` call converts them to parquet indices before returning.
+
+5. **`update_rewards()`** — incoming `ref_indices` are now parquet positions (from the remapped `get_reference_indices()`). Converts back to NPZ via `_dataset_to_npz` for cluster membership lookup and buffer storage.
+
+6. **`update_rollout_history()` fast path** — converts incoming parquet `dataset_idx` values to NPZ positions via `_dataset_to_npz` before storing in the buffer.
+
+**How to verify alignment is working:** Check the startup logs:
+```
+# Good — full alignment:
+[ClusterSelector] Building NPZ↔parquet alignment from /path/to/dataset.json ...
+[ClusterSelector] Alignment: 22675/22675 NPZ rows matched to parquet rows (0 NPZ rows have no parquet counterpart and will be excluded from selection).
+
+# Warning — partial alignment (some JSON samples filtered during parquet creation):
+[ClusterSelector] Alignment: 22432/22675 NPZ rows matched to parquet rows (243 NPZ rows have no parquet counterpart and will be excluded from selection).
+[ClusterSelector] Unmatched rows are typically samples in the JSON that were filtered out during parquet creation (missing images, preprocessing failures, etc.).
+
+# Bad — dataset_json_file not set:
+[ClusterSelector] WARNING: dataset_json_file not set. Assuming NPZ row order == parquet row order. If they differ, REPR rollouts and select() will reference wrong parquet rows. Set data_selection.cluster.dataset_json_file to the JSON source used to build the embeddings.
+```
+
+After alignment, REPR rollout logs will show the *same* samples selected each round (medoids are stable), and selection will concentrate on high-variance regions:
+```
+# With alignment fix:
+[ClusterSelector] Selected 2268 samples (strategy=interpolated, budget=2268)
+# These 2268 parquet indices now correctly correspond to the NPZ rows predicted
+# to have high variance.
+```
+
+**Required for all use cases**, not just `use_rollout_history`. Every strategy (`scored`, `weighted`, `top_clusters`, `interpolated`) is affected because they all call `select()` which remaps NPZ→parquet.
 
 ---
 
@@ -230,7 +405,7 @@ What matches the offline pipeline conceptually:
 | `03b_compute_cluster_scores.py` | `_compute_static_scores()` — transferability + density (geometry only; same formulas) |
 | `04_select_samples.py` — `top_clusters`, `weighted`, `scored`, `interpolated`, MMD, `dots_interpolate` | `_select_top_clusters`, `_select_weighted`, `_select_scored`, `_select_interpolated`, `_within_cluster_select` / `_dots_interpolate` |
 
-**Shared artifact:** The recommended path is to produce **`cluster_arrays.npz`** (and optionally embeddings) with the offline `00_`–`02_` scripts, then point `data_selection.cluster.cluster_arrays_file` at that file. Row order in the parquet / `RLHFDataset` must align with row order in that `.npz` (same indexing as when embeddings were built).
+**Shared artifact:** The recommended path is to produce **`cluster_arrays.npz`** (and optionally embeddings) with the offline `00_`–`02_` scripts, then point `data_selection.cluster.cluster_arrays_file` at that file. The `.npz` is built from a JSON source file that typically has a **different row ordering** from the training parquet (they are produced by independent pipelines). Always set `data_selection.cluster.dataset_json_file` to the source JSON used to build the embeddings so the selector can build the NPZ↔parquet alignment map at startup. See the alignment bug section below.
 
 ## Configuration
 
@@ -262,11 +437,36 @@ data_selection:
 
   cluster:
     cluster_arrays_file: /path/to/cluster_arrays.npz
+    # REQUIRED: path to the JSON/JSONL used to build the cluster embeddings.
+    # Enables NPZ↔parquet row alignment. Without this, selection silently picks wrong samples.
+    dataset_json_file: /path/to/source_dataset.json
     n_clusters: 50
     n_reps: 5
-    strategy: scored
+    strategy: scored             # or: top_clusters, weighted, interpolated
     within_cluster_method: centroid_nearest
     score_temperature: 0.1
+    # interpolated-only options:
+    dots_temperature: 0.05
+    dots_top_k: 64
+    dots_diversity: false                    # true → per-cluster allocation with diversity floor
+    dots_diversity_use_composite_score: false # true → weight by var×transferability×(1/density)
+    dots_diversity_temperature: 0.1          # softmax temperature for cluster allocation
+    dots_diversity_anneal: false             # true → decay temperature over training
+    dots_diversity_temperature_start: 1.0   # starting temp (hot = diverse)
+    dots_diversity_temperature_end: 0.05    # ending temp (cold = focused)
+    dots_diversity_temperature_decay: 0.1   # exp decay rate per selection round
+    # rollout history buffer (interpolated strategy only):
+    use_rollout_history: false              # true → accumulate training rollouts as DOTS refs
+    rollout_history_decay_rate: 0.05       # λ: higher = faster decay of old observations
+    rollout_history_max_age: 500           # discard entries older than this many steps
+    rollout_history_max_refs: 2000         # max reference points passed to DOTS
+    # exploration rollouts (breaks feedback loop in history buffer):
+    exploration_enabled: false             # true → periodically roll out random un-selected samples
+    exploration_pct: 5.0                   # % of dataset to explore each round
+    exploration_interval: 2                # explore every N selection rounds
+    # image grounding score (multimodal dependency):
+    igs_enabled: false                     # true → multiply composite score by IGS
+    igs_weight: 1.0                        # exponent on IGS in composite score
 ```
 
 ### DOTS Selection
@@ -295,6 +495,83 @@ data_selection:
 data_selection:
   method: none
 ```
+
+## Running Experiments
+
+The ready-to-use launch script is at:
+
+```
+verl/examples/grpo_trainer/run_qwen3_vl-2b_online_selection.sh
+```
+
+### Arguments
+
+```bash
+bash run_qwen3_vl-2b_online_selection.sh [ENGINE] [CLUSTER_ARRAYS] [VARIANT] [DATASET_JSON]
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `ENGINE` | `vllm` | Rollout engine (`vllm` or `sglang`) |
+| `CLUSTER_ARRAYS` | `outputs_300_cluster_new/cluster_arrays.npz` | Path to pre-computed cluster arrays from Stage 1 |
+| `VARIANT` | `interpolated_weighted` | Which selection configuration to use (see below) |
+| `DATASET_JSON` | `VLAA-Thinking-GRPO-25K_train_90_100.json` | **Required.** Path to the JSON/JSONL used to build the cluster embeddings. Used to align NPZ row order with parquet row order at startup. Without this, REPR rollouts and `select()` reference wrong parquet rows. |
+
+### Variants
+
+| VARIANT | Strategy | History buffer | Experiment name suffix |
+|---|---|---|---|
+| `interpolated_weighted` ★ | `interpolated` + `dots_diversity=true` | `use_rollout_history=true` — training-batch rollouts accumulate with time-decay into the DOTS reference set. Buffer starts at K×n_reps REPR medoids and grows to `rollout_history_max_refs=2000` when `n_clusters × n_reps < 2000` (requires the `dataset_idx` fix — see bug note in rollout history section). | `interpolated_weighted` |
+| `interpolated` | `interpolated` + `dots_diversity=true` | Fixed REPR medoids only (K × n_reps refs). No buffer growth. | `interpolated_centroid` |
+
+★ default
+
+### Usage examples
+
+```bash
+# Default: interpolated + time-weighted rollout history buffer
+bash examples/grpo_trainer/run_qwen3_vl-2b_online_selection.sh
+
+# Explicit default:
+bash examples/grpo_trainer/run_qwen3_vl-2b_online_selection.sh vllm /path/to/cluster_arrays.npz interpolated_weighted
+
+# Without history buffer (compare against default):
+bash examples/grpo_trainer/run_qwen3_vl-2b_online_selection.sh vllm /path/to/cluster_arrays.npz interpolated
+
+# Override CUDA devices:
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash examples/grpo_trainer/run_qwen3_vl-2b_online_selection.sh
+
+# Pass extra Hydra overrides (appended after all script params):
+bash examples/grpo_trainer/run_qwen3_vl-2b_online_selection.sh vllm /path/cluster.npz interpolated_weighted \
+    data_selection.cluster.rollout_history_decay_rate=0.1 \
+    trainer.total_epochs=20
+```
+
+### What the `interpolated_weighted` variant does
+
+```
+Step 0  ──► REPR medoids rolled out (600 samples)
+             └─► buffer seeded with REPR rollouts
+Step 1..N ──► each training batch's rollouts added to buffer
+             └─► w(t) = exp(-0.05 × (current_step - t))
+                 older observations downweighted automatically
+Step 10  ──► selection round
+             └─► buffer now has 600 + N×batch REPR+training samples
+                 (capped at 2000, most recent kept)
+                 DOTS interpolates predicted variance for all 22K samples
+                 using this enriched, policy-tracking reference set
+```
+
+Rollout history params in effect for this variant:
+
+```yaml
+data_selection.cluster.use_rollout_history: true
+data_selection.cluster.rollout_history_decay_rate: 0.05   # half-life ~14 steps
+data_selection.cluster.rollout_history_max_age: 500        # prune entries >500 steps old
+data_selection.cluster.rollout_history_max_refs: 2000      # cap reference set size
+```
+
+---
 
 ## Preparing Data for Cluster Selection
 
@@ -359,16 +636,107 @@ When data selection is active, the following metrics are logged at each selectio
 
 | Metric | Description |
 |--------|-------------|
-| `data_selection/n_ref_samples` | Number of reference samples rolled out |
-| `data_selection/ref_reward_mean` | Mean reward across reference rollouts |
+| `data_selection/n_ref_samples` | Number of REPR reference samples rolled out this round |
+| `data_selection/ref_reward_mean` | Mean reward across REPR reference rollouts |
 | `data_selection/n_selected` | Number of samples selected for training |
 | `data_selection/selection_pct` | Percentage of full dataset selected |
 | `data_selection/cluster_var_mean` | Mean cluster variance (cluster method) |
 | `data_selection/cluster_var_max` | Max cluster variance |
-| `data_selection/n_zero_var_clusters` | Number of zero-variance clusters |
+| `data_selection/n_zero_var_clusters` | Number of zero-variance clusters — high values indicate the model has saturated easy/hard clusters; too many reduce signal quality for selection |
 | `data_selection/n_active_clusters` | Number of clusters with rollout data |
 | `data_selection/ref_solve_none` | Samples model never solves (DOTS) |
 | `data_selection/ref_solve_all` | Samples model always solves (DOTS) |
+| `data_selection/history_buffer_unique` | **`use_rollout_history` only.** Unique dataset positions in the buffer. Should grow from K×n_reps toward `rollout_history_max_refs` after the dataset_idx fix. If frozen at K×n_reps, training-batch rollouts are not being accumulated. |
+| `data_selection/history_buffer_total_entries` | **`use_rollout_history` only.** Total temporal entries summed across all buffer positions (one per step the sample was seen). Useful for gauging decay/pruning behavior. |
+| `data_selection/overlap_jaccard` | Jaccard similarity between current and previous selection round. Values >0.9 mean selection is effectively static. |
+| `data_selection/cumulative_coverage_pct` | Percentage of all data that has been selected at least once across all rounds. Low values = selection is stuck in a narrow region. |
+| `data_selection/cumulative_unique_selected` | Absolute count of unique samples ever selected. |
+| `data_selection/selection_round` | Current selection round number. |
+| `data_selection/n_clusters_ever_selected` | How many distinct clusters have had samples selected across all rounds. |
+| `data_selection/cluster_selection_freq_mean` | Mean per-cluster selection frequency (higher = more concentrated). |
+| `data_selection/cluster_selection_gini` | Gini coefficient of per-cluster selection frequency. 0=uniform, 1=all budget in one cluster. |
+| `data_selection/n_exploration_samples` | Number of exploration rollout samples this round (exploration feature). |
+| `data_selection/exploration_reward_mean` | Mean reward on exploration samples. |
+| `data_selection/igs_mean` | Mean Image Grounding Score across clusters (IGS feature). |
+| `data_selection/n_multimodal_clusters` | Number of clusters with IGS > 1.5 (strongly multimodal). |
+
+---
+
+### Exploration Rollouts
+
+When `exploration_enabled=true`, the selector periodically rolls out on **random un-selected samples** to break the feedback loop where the history buffer only sees previously-selected data.
+
+**Problem solved:** Without exploration, the DOTS reference set only contains samples that were already selected and trained on. The selector predicts variance by interpolating from this reference → selects similar samples → trains on them → adds to reference. This self-reinforcing loop means the selector never discovers that ignored regions may now be in the model's "zone of proximal development."
+
+**How it works:**
+1. Every `exploration_interval` selection rounds, `get_exploration_indices()` picks `exploration_pct`% of the dataset from the **un-selected** pool (samples NOT in the current training set)
+2. The trainer rolls out these samples using the same rollout infrastructure as REPR rollouts
+3. Results are fed into the history buffer via `update_exploration_rewards()`
+4. Next DOTS interpolation now has visibility into previously-ignored regions
+
+**Config:**
+```yaml
+data_selection.cluster:
+  exploration_enabled: true
+  exploration_pct: 5.0          # 5% of full dataset = ~1100 random un-selected samples
+  exploration_interval: 2       # explore every other selection round
+```
+
+**Cost:** Extra rollout time proportional to `exploration_pct`. With 5% and reselect_interval=10, that's ~1100 extra rollouts every 20 training steps — roughly 2x the REPR rollout cost every other round.
+
+---
+
+### Image Grounding Score (IGS)
+
+IGS measures **multimodal dependency**: whether a sample requires the image to answer correctly, or can be solved from text alone.
+
+```
+IGS(x) = Var(rewards_with_image) / Var(rewards_without_image)
+```
+
+| IGS Value | Interpretation |
+|-----------|---------------|
+| > 1.5 | Image is essential — genuinely multimodal |
+| ≈ 1.0 | Image has no effect — text shortcut exists |
+| < 0.5 | Question is trivial regardless of image |
+
+**Integration:** When `igs_enabled=true`, the composite cluster score becomes:
+```
+score[c] = predicted_var[c] × transferability[c] × (1/density[c]) × IGS[c]^igs_weight
+```
+
+This deprioritizes text-shortcuttable clusters and focuses budget on genuinely visual reasoning tasks.
+
+**Two ways to provide IGS:**
+1. **Pre-computed** (recommended): Run a one-time blinded rollout, save scores, load with `load_igs_scores(path)`. The file should be a `.npz` with key `igs_scores` of shape `(N,)`.
+2. **Online**: Call `update_igs_from_rollouts(indices, rewards_with, rewards_without)` with paired rollout results.
+
+**Config:**
+```yaml
+data_selection.cluster:
+  igs_enabled: false            # Enable IGS in composite scoring
+  igs_weight: 1.0               # Exponent on IGS in composite score (higher = stronger preference for multimodal)
+```
+
+---
+
+### Selection Overlap Tracking
+
+Automatically tracks how much the selected subset changes between rounds. Helps diagnose whether online selection is truly "dynamic" or effectively static.
+
+**Metrics logged (see table above):**
+- `overlap_jaccard` — Jaccard similarity with previous round (1.0 = identical selection)
+- `cumulative_coverage_pct` — % of all data ever selected (low = selection is narrow)
+- `cluster_selection_gini` — inequality of per-cluster selection frequency
+
+**Console output each round:**
+```
+[ClusterSelector] Overlap: jaccard=0.723, cumulative_coverage=34.2% (7756/22675)
+```
+
+**Offline visualization:** See `cluster_selection/visualize_selection_overlap.py` for detailed plots (Jaccard over time, coverage curves, cluster heatmaps, UMAP projections).
+
+---
 
 ## Design Principles
 
