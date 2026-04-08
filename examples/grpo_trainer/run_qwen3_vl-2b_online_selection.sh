@@ -6,11 +6,18 @@ set -x
 #   1. data.train_files points to the FULL dataset (not a pre-selected subset)
 #   2. data_selection.method=cluster enables online cluster-based selection
 #   3. data_selection.selection_budget_pct=10.0 selects top 10% each step
-#   4. data_selection.cluster.cluster_arrays_file points to pre-computed clusters
+#   4. data_selection.global_budget_pct caps cumulative unique samples over the
+#      entire run. Set equal to selection_budget_pct (e.g. both 10%) for a fair
+#      comparison with a fixed random baseline. When hit, pool composition
+#      freezes and reference/exploration rollouts are skipped (saves compute).
+#      Periodic reselection rounds continue to reweight within the frozen pool
+#      using training-batch reward variance (requires use_rollout_history=true).
+#      Set via GLOBAL_BUDGET_PCT env var; default=null (no cap).
+#   5. data_selection.cluster.cluster_arrays_file points to pre-computed clusters
 #      (outputs_300_cluster_new/cluster_arrays.npz from Stage 1)
-#   5. data_selection.cluster.dataset_json_file points to the JSON used to build
+#   6. data_selection.cluster.dataset_json_file points to the JSON used to build
 #      the embeddings — required for correct NPZ↔parquet index alignment
-#   6. trainer.total_epochs is increased since each epoch trains on 10% of data
+#   7. trainer.total_epochs is increased since each epoch trains on 10% of data
 #
 # Arguments:
 #   ENGINE          vllm or sglang (default: vllm)
@@ -75,6 +82,9 @@ set -x
 #   # Override CUDA devices:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash run_qwen3_vl-2b_online_selection.sh
 #
+#   # Fair comparison with random 10% (freeze after first smart selection):
+#   GLOBAL_BUDGET_PCT=10.0 bash run_qwen3_vl-2b_online_selection.sh
+#
 #   # Pass extra Hydra overrides (appended after all positional params):
 #   bash run_qwen3_vl-2b_online_selection.sh vllm /path/cluster.npz interpolated_weighted /path/dataset.json \
 #       data_selection.cluster.rollout_history_decay_rate=0.1 \
@@ -124,7 +134,6 @@ fi
 # Samples near p=0 or p=1 are zeroed out — under GRPO they produce no
 # gradient signal, so spending budget on them is wasted.
 # See README.md §"Asymmetric utility — breaking variance symmetry" for details.
-# Default off for backward compatibility; flip to "true" to enable.
 ASYMMETRIC_UTILITY=${ASYMMETRIC_UTILITY:-true}
 ASYMMETRIC_BIAS=${ASYMMETRIC_BIAS:-0.5}
 ASYMMETRIC_DEAD_LOW=${ASYMMETRIC_DEAD_LOW:-0.05}
@@ -134,7 +143,23 @@ if [ "$ASYMMETRIC_UTILITY" = "true" ]; then
     EXP_SUFFIX="${EXP_SUFFIX}_asym${ASYMMETRIC_BIAS}"
 fi
 
-EXP_NAME="bins_5_temp_k200_r3_top10pct_cluster_online_10pct_${EXP_SUFFIX}"
+# --- Global budget cap ---
+# Hard cap on cumulative unique samples ever selected across the whole run
+# (% of full dataset).  Once hit, the pool freezes and reselection rounds
+# reweight inside the frozen pool using DOTS-predicted variance (and mean,
+# when asymmetric utility is on).  Set equal to (per-round budget × n_rounds)
+# for a fair comparison against a fixed random baseline at the same %.
+GLOBAL_BUDGET_PCT=${GLOBAL_BUDGET_PCT:-10.0}
+
+# --- Reroll medoids each round? ---
+# When false, the medoid reference rollouts run only on round 0 (cold start),
+# and subsequent rounds rely on the rollout-history buffer accumulated from
+# training-step rewards.  This was the supervisor's recommendation: re-rolling
+# fixed medoids every round wastes compute because the buffer already tracks
+# fresher policy-state observations from neighbouring samples.
+REROLL_MEDOIDS=${REROLL_MEDOIDS:-false}
+
+EXP_NAME="v3_k200_r3_global10_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,3,4,5"} \
@@ -152,6 +177,7 @@ python3 -m verl.trainer.main_ppo \
     data_selection.reselect_schedule=step \
     data_selection.reselect_interval=18\
     data_selection.selection_budget_pct=10.0 \
+    data_selection.global_budget_pct=$GLOBAL_BUDGET_PCT \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
     data_selection.cluster.dataset_json_file=$DATASET_JSON \
     data_selection.cluster.n_clusters=200 \

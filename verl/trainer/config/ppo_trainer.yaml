@@ -134,6 +134,16 @@ data_selection:
   # Budget as percentage of full dataset (used when selection_budget is null)
   selection_budget_pct: 100.0
 
+  # Cap on cumulative unique samples across ALL selection rounds (% of dataset).
+  # When null (default), no cap — cumulative unique usage can grow unboundedly.
+  # When set, the pool composition freezes once unique samples reach this cap.
+  # Reference/exploration rollouts are skipped (saves compute), but periodic
+  # reselection rounds continue — reweighting within the frozen pool based on
+  # training-batch reward variance (requires use_rollout_history=true).
+  # Set equal to selection_budget_pct for a fair comparison with a fixed random
+  # baseline (e.g., both 10% → exactly 10% unique samples over the entire run).
+  global_budget_pct: null
+
   # Cluster-specific settings (used when method=cluster)
   cluster:
 

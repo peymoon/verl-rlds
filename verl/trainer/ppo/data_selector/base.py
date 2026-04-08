@@ -27,6 +27,17 @@ class DataSelectionConfig:
     selection_budget: Optional[int] = None
     selection_budget_pct: float = 100.0
 
+    # Cap on cumulative unique samples seen over the entire run.
+    # When set, the selector freezes the pool once the union of all selected
+    # samples reaches this percentage of the full dataset.  After freeze:
+    #   - Reference and exploration rollouts are skipped (saves compute)
+    #   - Training-batch rollout rewards continue accumulating (if use_rollout_history)
+    #   - Periodic reselection rounds reweight within the frozen pool based on
+    #     accumulated per-sample variance (high-variance samples appear more often)
+    # Set equal to selection_budget_pct for a fair comparison with a fixed
+    # random baseline (e.g., both at 10% → exactly 10% unique samples).
+    global_budget_pct: Optional[float] = None
+
     cluster: dict = field(default_factory=dict)
     dots: dict = field(default_factory=dict)
 
@@ -44,6 +55,7 @@ class DataSelector(ABC):
     def __init__(self, config: DataSelectionConfig):
         self.config = config
         self._step_count = 0
+        self._selection_frozen = False
 
     @abstractmethod
     def initialize(self, dataset, collate_fn=None) -> None:
@@ -86,7 +98,12 @@ class DataSelector(ABC):
         """
 
     def should_reselect_epoch(self, epoch: int) -> bool:
-        """True at epoch start when using reselect_schedule='epoch'."""
+        """True at epoch start when using reselect_schedule='epoch'.
+
+        Still fires when the pool is frozen (for variance-weighted resampling
+        within the frozen pool).  Reference rollouts are skipped by the
+        selector's get_reference_indices() returning [].
+        """
         if self.config.reselect_schedule != "epoch":
             return False
         if self.config.reselect_interval <= 0:
@@ -98,6 +115,10 @@ class DataSelector(ABC):
 
         Called with the trainer's global_steps value *after* that step's update
         (i.e. after increment). Reselect when global_step % interval == 0.
+
+        Still fires when the pool is frozen (for variance-weighted resampling
+        within the frozen pool).  Reference rollouts are skipped by the
+        selector's get_reference_indices() returning [].
         """
         if self.config.reselect_schedule != "step":
             return False

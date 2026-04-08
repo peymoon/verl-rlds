@@ -126,7 +126,7 @@ Every `data_selection.*` key in the bash script maps directly to a config field.
 | `data_selection.reselect_interval` | `1` | `base.py: should_reselect_epoch/step()` | Every N epochs or steps |
 | `data_selection.selection_budget_pct` | `100.0` | `base.py: get_selection_budget()` | % of full dataset to select |
 | `data_selection.selection_budget` | `None` | `base.py: get_selection_budget()` | Absolute sample count (overrides pct) |
-| `data_selection.global_budget_pct` | `None` | `base.py` + `cluster_selector.py: select()` | Cap on cumulative unique samples over the entire run (% of full dataset). When the union of all ever-selected samples reaches this cap, selection freezes and subsequent reselection rounds are skipped. Set equal to `selection_budget_pct` for a fair comparison with a fixed random baseline. See [Global Budget Cap](#global-budget-cap-global_budget_pct) below. |
+| `data_selection.global_budget_pct` | `None` | `base.py` + `cluster_selector.py: select()` | Cap on cumulative unique samples over the entire run (% of full dataset). When the union of all ever-selected samples reaches this cap, selection freezes and subsequent reselection rounds reweight inside the frozen pool. Set equal to `selection_budget_pct` for a fair comparison with a fixed random baseline. |
 | `data_selection.cluster.cluster_arrays_file` | `None` | `cluster_selector.py: _load_precomputed_clusters()` | Path to `.npz` with embeddings+centroids+assignments |
 | `data_selection.cluster.embeddings_file` | `None` | `cluster_selector.py: _load_embeddings_and_cluster()` | Path to raw embeddings (runs FAISS at startup) |
 | `data_selection.cluster.n_clusters` | `50` | `cluster_selector.py: _load_embeddings_and_cluster()` | K for KMeans (ignored if cluster_arrays_file given) |
@@ -791,6 +791,89 @@ IGS(x) = Var(rewards_with_image) / Var(rewards_without_image)
 ```
 score[c] = predicted_var[c] × transferability[c] × (1/density[c]) × IGS[c]^igs_weight
 ```
+
+This deprioritizes text-shortcuttable clusters and focuses budget on genuinely visual reasoning tasks.
+
+**Two ways to provide IGS:**
+1. **Pre-computed** (recommended): Run a one-time blinded rollout, save scores, load with `load_igs_scores(path)`. The file should be a `.npz` with key `igs_scores` of shape `(N,)`.
+2. **Online**: Call `update_igs_from_rollouts(indices, rewards_with, rewards_without)` with paired rollout results.
+
+**Config:**
+```yaml
+data_selection.cluster:
+  igs_enabled: false            # Enable IGS in composite scoring
+  igs_weight: 1.0               # Exponent on IGS in composite score (higher = stronger preference for multimodal)
+```
+
+---
+
+### Global Budget Cap (`global_budget_pct`)
+
+By default, the online selector picks a fresh `selection_budget_pct`% subset each round. Because the model's capabilities change, different samples are selected each round, and the **cumulative** unique data seen over training grows well beyond the per-round budget (often 30–50%+). This makes comparison with a fixed random baseline unfair — the random baseline sees exactly `selection_budget_pct`% unique samples total.
+
+Setting `global_budget_pct` caps the cumulative unique sample count. Once the union of all ever-selected samples reaches the cap, the **pool composition freezes** (no new samples). But periodic reselection rounds continue — they just skip reference/exploration rollouts and instead **reweight within the frozen pool** using training-batch reward variance.
+
+**Typical usage — fair comparison with random 10%:**
+```bash
+data_selection.selection_budget_pct=10.0 \
+data_selection.global_budget_pct=10.0
+```
+
+With `global_budget_pct == selection_budget_pct`, the first selection round uses initial-policy rollouts + DOTS interpolation to pick the smartest 10% of the dataset, then freezes the pool. The model trains on exactly 10% unique samples — identical data volume to the random baseline — but the *which* 10% is variance-informed rather than random.
+
+**Adaptive reweighting within the frozen pool:**
+
+After the pool freezes, subsequent reselection rounds are lightweight (no rollouts):
+
+1. Training-batch reward variances continue accumulating in `_rollout_buffer` (requires `use_rollout_history=True`)
+2. Every `reselect_interval` steps, `select()` computes time-weighted per-sample variance from the buffer
+3. Samples with high variance (still in the learning zone) are sampled more frequently
+4. Samples with zero variance (mastered or too hard) are sampled less frequently (but with a 5% floor weight to prevent starvation)
+5. The dataloader is rebuilt with variance-weighted sampling (with replacement)
+
+This means: even though the set of unique samples is fixed, the model spends more compute on informative samples — effectively a curriculum within the frozen pool.
+
+**Compute savings:** Reference rollouts (~500 samples × 17 rounds ≈ 8,500 inference passes) and exploration rollouts are eliminated. Only the cheap reweight computation runs.
+
+**Config:**
+```yaml
+data_selection:
+  selection_budget_pct: 10.0
+  global_budget_pct: 10.0        # freeze pool after first round
+  cluster:
+    use_rollout_history: true    # required for adaptive reweighting
+```
+
+**Console output:**
+```
+[ClusterSelector] Global budget cap reached: 2268 unique NPZ samples >= 2268 (10.0% of 22675). Pool frozen — subsequent rounds will reweight within this pool using training reward variance.
+[ClusterSelector] Frozen reweight round 2: 1847 unique/2268 total, max_reps=4, var=[0.0000, 0.2500], zero_var=312/2268
+```
+
+**WandB metrics (frozen pool):**
+- `data_selection/frozen_pool_var_mean` — mean per-sample variance in the pool (should decrease as model learns)
+- `data_selection/frozen_pool_n_zero_var` — samples with zero variance (mastered/too-hard; downweighted in sampling)
+- `data_selection/frozen_pool_n_with_data` — samples with at least one training observation in the buffer
+
+If `use_rollout_history=False`, the reweight falls back to uniform sampling (all pool samples equally likely).
+
+---
+
+### Selection Overlap Tracking
+
+Automatically tracks how much the selected subset changes between rounds. Helps diagnose whether online selection is truly "dynamic" or effectively static.
+
+**Metrics logged (see table above):**
+- `overlap_jaccard` — Jaccard similarity with previous round (1.0 = identical selection)
+- `cumulative_coverage_pct` — % of all data ever selected (low = selection is narrow)
+- `cluster_selection_gini` — inequality of per-cluster selection frequency
+
+**Console output each round:**
+```
+[ClusterSelector] Overlap: jaccard=0.723, cumulative_coverage=34.2% (7756/22675)
+```
+
+**Offline visualization:** See `cluster_selection/visualize_selection_overlap.py` for detailed plots (Jaccard over time, coverage curves, cluster heatmaps, UMAP projections).
 
 ---
 
