@@ -166,6 +166,7 @@ class ClusterSelector(DataSelector):
         self._selection_jaccard: float = 0.0
         self._selection_history: List[set] = []  # all rounds' NPZ index sets
         self._per_cluster_coverage: Dict[int, int] = {}  # cluster_id -> times selected
+        self._ever_selected_set: set = set()  # running union of all NPZ indices ever selected
 
         # --- Exploration rollouts ---
         self._exploration_indices: List[int] = []  # NPZ indices for next exploration
@@ -194,6 +195,9 @@ class ClusterSelector(DataSelector):
         self._dataset_to_npz: Optional[Dict[int, int]] = None
 
         self._current_training_step: int = 0
+
+        # NPZ indices of the frozen pool (set when global budget cap triggers).
+        self._frozen_pool_npz: Optional[List[int]] = None
 
         self._rng = np.random.RandomState(42)
 
@@ -494,6 +498,8 @@ class ClusterSelector(DataSelector):
               f"Density: mean={self._density[self._density > 0].mean():.4f}")
 
     def get_reference_indices(self) -> List[int]:
+        if self._selection_frozen:
+            return []
         # _rep_indices are in NPZ order. Remap to parquet order before returning
         # so the trainer's Subset(dataset, ref_indices) accesses the correct rows.
         return self._remap_npz_to_dataset(self._rep_indices)
@@ -720,6 +726,8 @@ class ClusterSelector(DataSelector):
 
         Returns parquet-order indices (like get_reference_indices).
         """
+        if self._selection_frozen:
+            return []
         if not self.cluster_config.exploration_enabled:
             return []
         if self._selection_round % self.cluster_config.exploration_interval != 0:
@@ -876,6 +884,10 @@ class ClusterSelector(DataSelector):
 
     def select(self, budget: int) -> List[int]:
         self._selection_round += 1
+
+        if self._selection_frozen:
+            return self._select_frozen_reweight(budget)
+
         if not self._cluster_variances:
             print("[ClusterSelector] No variance data yet, selecting random")
             return self._rng.choice(
@@ -904,28 +916,139 @@ class ClusterSelector(DataSelector):
             self._selection_jaccard = 0.0
         self._prev_selected_set = current_set
         self._selection_history.append(current_set)
+        self._ever_selected_set |= current_set
 
         # Track per-cluster selection frequency
         for idx in npz_indices:
             c_id = int(self._cluster_ids[idx])
             self._per_cluster_coverage[c_id] = self._per_cluster_coverage.get(c_id, 0) + 1
 
-        # Count how many unique samples have EVER been selected across all rounds
-        all_ever_selected = set()
-        for s in self._selection_history:
-            all_ever_selected |= s
-        coverage_pct = 100.0 * len(all_ever_selected) / max(len(self._embeddings), 1)
+        n_embeddings = len(self._embeddings)
+        coverage_pct = 100.0 * len(self._ever_selected_set) / max(n_embeddings, 1)
 
         print(f"[ClusterSelector] Overlap: jaccard={self._selection_jaccard:.3f}, "
-              f"cumulative_coverage={coverage_pct:.1f}% ({len(all_ever_selected)}/{len(self._embeddings)})")
+              f"cumulative_coverage={coverage_pct:.1f}% ({len(self._ever_selected_set)}/{n_embeddings})")
 
         # Remap NPZ positions → parquet positions so the trainer's
         # Subset(train_dataset, indices) accesses the correct rows.
         indices = self._remap_npz_to_dataset(npz_indices)
 
+        # --- Global budget enforcement ---
+        # When global_budget_pct is set, freeze selection once cumulative unique
+        # samples reach the cap. With global_budget_pct == selection_budget_pct,
+        # this freezes after the very first round (Option A: smart static 10%).
+        if self.config.global_budget_pct is not None:
+            global_max = max(1, int(n_embeddings * self.config.global_budget_pct / 100.0))
+            if len(self._ever_selected_set) >= global_max:
+                self._selection_frozen = True
+                self._frozen_pool_npz = sorted(self._ever_selected_set)
+                print(f"[ClusterSelector] Global budget cap reached: "
+                      f"{len(self._ever_selected_set)} unique NPZ samples >= {global_max} "
+                      f"({self.config.global_budget_pct}% of {n_embeddings}). "
+                      f"Pool frozen — subsequent rounds will reweight within "
+                      f"this pool using training reward variance.")
+
         self._last_selected_indices = indices
         print(f"[ClusterSelector] Selected {len(indices)} samples "
               f"(strategy={strategy}, budget={budget})")
+        return indices
+
+    def _select_frozen_reweight(self, budget: int) -> List[int]:
+        """DOTS-interpolated variance-weighted sampling within the frozen pool.
+
+        After the global budget cap freezes the pool composition, this method
+        replaces the normal strategy-based selection.  It reuses the same DOTS
+        interpolation machinery as _select_interpolated but restricts output
+        to the frozen pool:
+
+        1. Build reference set from rollout history buffer (training-batch
+           rewards accumulated every step + decayed medoid rollouts from round 0)
+        2. DOTS interpolation: predict variance for ALL embeddings using
+           cosine-similarity-weighted averaging of reference variances
+        3. Extract predicted variances for pool samples only
+        4. Sample pool indices with replacement, weighted by predicted variance
+
+        This means samples the model hasn't trained on recently still get good
+        variance predictions (from similar samples that WERE recently observed),
+        instead of falling back to a blind floor weight.
+
+        Falls back to uniform sampling when no variance data is available
+        (e.g. use_rollout_history=False or first round after freeze).
+        """
+        from collections import Counter
+
+        pool = self._frozen_pool_npz
+        if pool is None or len(pool) == 0:
+            pool = sorted(self._ever_selected_set)
+        n_pool = len(pool)
+
+        if n_pool == 0:
+            print("[ClusterSelector] Frozen reweight: empty pool, selecting random")
+            return self._rng.choice(
+                self._dataset_size, size=min(budget, self._dataset_size), replace=False
+            ).tolist()
+
+        # Build DOTS reference set from rollout history, same as _select_interpolated.
+        has_refs = False
+        if self.cluster_config.use_rollout_history and self._rollout_buffer:
+            tw_vars = self._compute_time_weighted_variances(self._current_training_step)
+            if tw_vars:
+                ref_indices = np.array(list(tw_vars.keys()))
+                ref_variances = np.array(list(tw_vars.values()), dtype=np.float32)
+                has_refs = True
+                print(f"[ClusterSelector] Frozen reweight DOTS reference: "
+                      f"{len(ref_indices)} samples from rollout history "
+                      f"(step={self._current_training_step})")
+
+        if not has_refs:
+            # No rollout history — uniform sampling from pool.
+            chosen_npz = list(pool) if n_pool <= budget else \
+                self._rng.choice(pool, size=budget, replace=False).tolist()
+            indices = self._remap_npz_to_dataset(chosen_npz)
+            self._last_selected_indices = indices
+            print(f"[ClusterSelector] Frozen reweight round {self._selection_round}: "
+                  f"no variance data yet, uniform {len(indices)} samples")
+            return indices
+
+        if ref_variances.sum() == 0:
+            chosen_npz = list(pool) if n_pool <= budget else \
+                self._rng.choice(pool, size=budget, replace=False).tolist()
+            indices = self._remap_npz_to_dataset(chosen_npz)
+            self._last_selected_indices = indices
+            print(f"[ClusterSelector] Frozen reweight round {self._selection_round}: "
+                  f"all reference variances are zero, uniform {len(indices)} samples")
+            return indices
+
+        # DOTS interpolation: predict variance for ALL samples, then slice to pool.
+        predicted_var_all = self._dots_interpolate(ref_indices, ref_variances)
+        pool_arr = np.array(pool)
+        variances = predicted_var_all[pool_arr]
+
+        # Floor: 5% of max predicted variance. Prevents starvation so the
+        # model revisits "mastered" samples occasionally (they might become
+        # informative again after further policy updates).
+        max_var = variances.max()
+        floor = max(max_var * 0.05, 1e-8)
+        weights = np.maximum(variances, floor)
+        weights /= weights.sum()
+
+        # Sample with replacement — high-variance samples appear multiple times.
+        chosen_positions = self._rng.choice(n_pool, size=budget, replace=True, p=weights)
+        chosen_npz = [pool[pos] for pos in chosen_positions]
+
+        indices = self._remap_npz_to_dataset(chosen_npz)
+        self._last_selected_indices = indices
+
+        n_unique = len(set(chosen_npz))
+        counts = Counter(chosen_npz)
+        max_reps = max(counts.values())
+        n_zero_pred = int(np.sum(variances < 1e-8))
+        n_refs_in_pool = int(np.sum(np.isin(pool_arr, ref_indices)))
+        print(f"[ClusterSelector] Frozen reweight round {self._selection_round}: "
+              f"{n_unique} unique/{budget} total, max_reps={max_reps}, "
+              f"predicted_var=[{variances.min():.4f}, {variances.max():.4f}], "
+              f"zero_pred={n_zero_pred}/{n_pool}, "
+              f"refs_in_pool={n_refs_in_pool}/{len(ref_indices)}")
         return indices
 
     def _select_top_clusters(self, budget: int) -> List[int]:
@@ -1323,15 +1446,41 @@ class ClusterSelector(DataSelector):
 
         # --- Selection overlap metrics ---
         metrics["data_selection/overlap_jaccard"] = self._selection_jaccard
-        if self._selection_history:
-            all_ever = set()
-            for s in self._selection_history:
-                all_ever |= s
+        if self._ever_selected_set:
             metrics["data_selection/cumulative_coverage_pct"] = (
-                100.0 * len(all_ever) / max(len(self._embeddings), 1)
+                100.0 * len(self._ever_selected_set) / max(len(self._embeddings), 1)
             )
-            metrics["data_selection/cumulative_unique_selected"] = float(len(all_ever))
+            metrics["data_selection/cumulative_unique_selected"] = float(len(self._ever_selected_set))
             metrics["data_selection/selection_round"] = float(self._selection_round)
+
+            # Report global budget cap utilization if enabled
+            if self.config.global_budget_pct is not None:
+                global_max = max(1, int(len(self._embeddings) * self.config.global_budget_pct / 100.0))
+                metrics["data_selection/global_budget"] = float(global_max)
+                metrics["data_selection/global_budget_utilization_pct"] = (
+                    100.0 * len(self._ever_selected_set) / global_max
+                )
+                metrics["data_selection/selection_frozen"] = float(self._selection_frozen)
+
+                # Reweight stats: DOTS-predicted variance within the frozen pool
+                if self._selection_frozen and self._rollout_buffer:
+                    pool = self._frozen_pool_npz or sorted(self._ever_selected_set)
+                    if self.cluster_config.use_rollout_history:
+                        tw_vars = self._compute_time_weighted_variances(
+                            self._current_training_step)
+                        if tw_vars:
+                            ref_idx = np.array(list(tw_vars.keys()))
+                            ref_var = np.array(list(tw_vars.values()), dtype=np.float32)
+                            pred_all = self._dots_interpolate(ref_idx, ref_var)
+                            pool_arr = np.array(pool)
+                            pv = pred_all[pool_arr]
+                            n_refs_in_pool = int(np.sum(np.isin(pool_arr, ref_idx)))
+                            metrics["data_selection/frozen_pool_var_mean"] = float(pv.mean())
+                            metrics["data_selection/frozen_pool_var_max"] = float(pv.max())
+                            metrics["data_selection/frozen_pool_n_zero_var"] = float(
+                                np.sum(pv < 1e-8))
+                            metrics["data_selection/frozen_pool_refs_in_pool"] = float(
+                                n_refs_in_pool)
 
         # Per-cluster selection frequency stats (how evenly distributed is selection?)
         if self._per_cluster_coverage:

@@ -6,11 +6,18 @@ set -x
 #   1. data.train_files points to the FULL dataset (not a pre-selected subset)
 #   2. data_selection.method=cluster enables online cluster-based selection
 #   3. data_selection.selection_budget_pct=10.0 selects top 10% each step
-#   4. data_selection.cluster.cluster_arrays_file points to pre-computed clusters
+#   4. data_selection.global_budget_pct caps cumulative unique samples over the
+#      entire run. Set equal to selection_budget_pct (e.g. both 10%) for a fair
+#      comparison with a fixed random baseline. When hit, pool composition
+#      freezes and reference/exploration rollouts are skipped (saves compute).
+#      Periodic reselection rounds continue to reweight within the frozen pool
+#      using training-batch reward variance (requires use_rollout_history=true).
+#      Set via GLOBAL_BUDGET_PCT env var; default=null (no cap).
+#   5. data_selection.cluster.cluster_arrays_file points to pre-computed clusters
 #      (outputs_300_cluster_new/cluster_arrays.npz from Stage 1)
-#   5. data_selection.cluster.dataset_json_file points to the JSON used to build
+#   6. data_selection.cluster.dataset_json_file points to the JSON used to build
 #      the embeddings — required for correct NPZ↔parquet index alignment
-#   6. trainer.total_epochs is increased since each epoch trains on 10% of data
+#   7. trainer.total_epochs is increased since each epoch trains on 10% of data
 #
 # Arguments:
 #   ENGINE          vllm or sglang (default: vllm)
@@ -58,13 +65,16 @@ set -x
 #   # Override CUDA devices:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash run_qwen3_vl-2b_online_selection.sh
 #
+#   # Fair comparison with random 10% (freeze after first smart selection):
+#   GLOBAL_BUDGET_PCT=10.0 bash run_qwen3_vl-2b_online_selection.sh
+#
 #   # Pass extra Hydra overrides (appended after all positional params):
 #   bash run_qwen3_vl-2b_online_selection.sh vllm /path/cluster.npz interpolated_weighted /path/dataset.json \
 #       data_selection.cluster.rollout_history_decay_rate=0.1 \
 #       trainer.total_epochs=20
 
 ENGINE=${1:-vllm}
-CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz}
+CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz}
 VARIANT=${3:-interpolated_weighted}
 # Path to the JSON/JSONL that was used to build the cluster embeddings.
 # Required to correctly align NPZ row order with parquet row order — these
@@ -97,7 +107,8 @@ else
     exit 1
 fi
 
-EXP_NAME="fixed2_k50_r10_top10pct_cluster_online_10pct_${EXP_SUFFIX}"
+GLOBAL_BUDGET_PCT=${GLOBAL_BUDGET_PCT:-10.0}  # Cap on cumulative unique samples selected across all rounds (default: 10%, set via env var)
+EXP_NAME="limited_k200_r3_top10pct_cluster_online_10pct_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"3,4,5,7"} \
@@ -115,10 +126,11 @@ python3 -m verl.trainer.main_ppo \
     data_selection.reselect_schedule=step \
     data_selection.reselect_interval=10 \
     data_selection.selection_budget_pct=10.0 \
+    data_selection.global_budget_pct=$GLOBAL_BUDGET_PCT \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
     data_selection.cluster.dataset_json_file=$DATASET_JSON \
-    data_selection.cluster.n_clusters=50 \
-    data_selection.cluster.n_reps=10 \
+    data_selection.cluster.n_clusters=200 \
+    data_selection.cluster.n_reps=3 \
     data_selection.cluster.strategy=interpolated \
     data_selection.cluster.within_cluster_method=centroid_nearest \
     data_selection.cluster.representative_method=medoid \
