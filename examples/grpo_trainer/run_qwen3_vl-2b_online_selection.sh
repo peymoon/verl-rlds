@@ -45,9 +45,26 @@ set -x
 # Pre-requisite: run the offline cluster pipeline (stages 0-1) to produce
 #   cluster_arrays.npz. See cluster_selection/README.md for instructions.
 #
+# Environment variables (optional):
+#   ASYMMETRIC_UTILITY   false (default) | true — enable hard-side-biased
+#                        utility = predicted_var * (1 + α*(0.5 - predicted_mean)).
+#                        Requires VARIANT=interpolated_weighted or interpolated.
+#                        See README §"Asymmetric utility" for details.
+#   ASYMMETRIC_BIAS      α in the utility expression (default 0.5).
+#   ASYMMETRIC_DEAD_LOW  lower dead-zone on predicted mean reward (default 0.05).
+#   ASYMMETRIC_DEAD_HIGH upper dead-zone on predicted mean reward (default 0.95).
+#
 # Usage examples:
 #   # Default: interpolated + time-weighted rollout history buffer
 #   bash run_qwen3_vl-2b_online_selection.sh
+#
+#   # Same, but with asymmetric utility enabled (α=0.5, default dead-zone):
+#   ASYMMETRIC_UTILITY=true bash run_qwen3_vl-2b_online_selection.sh
+#
+#   # Stronger hard-side bias and tighter dead-zone:
+#   ASYMMETRIC_UTILITY=true ASYMMETRIC_BIAS=1.0 \
+#       ASYMMETRIC_DEAD_LOW=0.1 ASYMMETRIC_DEAD_HIGH=0.9 \
+#       bash run_qwen3_vl-2b_online_selection.sh
 #
 #   # Explicit defaults:
 #   bash run_qwen3_vl-2b_online_selection.sh vllm /path/to/cluster_arrays.npz interpolated_weighted /path/to/dataset.json
@@ -64,7 +81,7 @@ set -x
 #       trainer.total_epochs=20
 
 ENGINE=${1:-vllm}
-CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz}
+CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz}
 VARIANT=${3:-interpolated_weighted}
 # Path to the JSON/JSONL that was used to build the cluster embeddings.
 # Required to correctly align NPZ row order with parquet row order — these
@@ -97,10 +114,30 @@ else
     exit 1
 fi
 
-EXP_NAME="fixed2_k50_r10_top10pct_cluster_online_10pct_${EXP_SUFFIX}"
+# --- Asymmetric utility (hard-side bias) ---
+# Variance is symmetric around p=0.5: a sample the policy solves 1/8 times
+# looks identical to one it solves 7/8 times to the pure `interpolated`
+# strategy.  When ASYMMETRIC_UTILITY=true, the selector predicts per-sample
+# mean reward via DOTS in parallel with variance and reweights:
+#   utility = predicted_var * (1 + ASYMMETRIC_BIAS * (0.5 - predicted_mean))
+# so at equal variance, harder samples (lower predicted mean) score higher.
+# Samples near p=0 or p=1 are zeroed out — under GRPO they produce no
+# gradient signal, so spending budget on them is wasted.
+# See README.md §"Asymmetric utility — breaking variance symmetry" for details.
+# Default off for backward compatibility; flip to "true" to enable.
+ASYMMETRIC_UTILITY=${ASYMMETRIC_UTILITY:-true}
+ASYMMETRIC_BIAS=${ASYMMETRIC_BIAS:-0.5}
+ASYMMETRIC_DEAD_LOW=${ASYMMETRIC_DEAD_LOW:-0.05}
+ASYMMETRIC_DEAD_HIGH=${ASYMMETRIC_DEAD_HIGH:-0.95}
+
+if [ "$ASYMMETRIC_UTILITY" = "true" ]; then
+    EXP_SUFFIX="${EXP_SUFFIX}_asym${ASYMMETRIC_BIAS}"
+fi
+
+EXP_NAME="bins_5_temp_k200_r3_top10pct_cluster_online_10pct_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"3,4,5,7"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,3,4,5"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet \
@@ -113,16 +150,17 @@ python3 -m verl.trainer.main_ppo \
     data.image_key=images \
     data_selection.method=cluster \
     data_selection.reselect_schedule=step \
-    data_selection.reselect_interval=10 \
+    data_selection.reselect_interval=18\
     data_selection.selection_budget_pct=10.0 \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
     data_selection.cluster.dataset_json_file=$DATASET_JSON \
-    data_selection.cluster.n_clusters=50 \
-    data_selection.cluster.n_reps=10 \
+    data_selection.cluster.n_clusters=200 \
+    data_selection.cluster.n_reps=3 \
     data_selection.cluster.strategy=interpolated \
     data_selection.cluster.within_cluster_method=centroid_nearest \
     data_selection.cluster.representative_method=medoid \
     data_selection.cluster.dots_temperature=0.05 \
+    data_selection.cluster.dots_diversity_temperature=0.5 \
     data_selection.cluster.dots_top_k=64 \
     data_selection.cluster.dots_diversity=$DOTS_DIVERSITY \
     data_selection.cluster.dots_diversity_use_composite_score=$DOTS_COMPOSITE \
@@ -136,6 +174,10 @@ python3 -m verl.trainer.main_ppo \
     data_selection.cluster.exploration_interval=2 \
     data_selection.cluster.igs_enabled=false \
     data_selection.cluster.igs_weight=1.0 \
+    data_selection.cluster.asymmetric_utility_enabled=$ASYMMETRIC_UTILITY \
+    data_selection.cluster.hard_side_bias=$ASYMMETRIC_BIAS \
+    data_selection.cluster.asymmetric_dead_zone_low=$ASYMMETRIC_DEAD_LOW \
+    data_selection.cluster.asymmetric_dead_zone_high=$ASYMMETRIC_DEAD_HIGH \
     actor_rollout_ref.model.path=Qwen/Qwen3-VL-2B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \

@@ -81,6 +81,25 @@ class ClusterSelectorConfig:
     #  - "representatives": percent of current reference-set size (n_reps * n_clusters)
     exploration_pct_base: str = "representatives"
 
+    # --- Asymmetric utility (hard-side bias) ---
+    # Variance alone is symmetric around p=0.5, so a sample with 1/8 successes
+    # (barely passed) and a sample with 7/8 successes (almost mastered) look
+    # identical to the interpolated strategy.  Empirically the 1/8 case is more
+    # informative — it lives at the policy's capability frontier and solving it
+    # expands capability rather than reinforcing it.  When enabled, we predict
+    # both per-sample variance AND per-sample mean reward via DOTS, then form:
+    #
+    #   utility = predicted_var * (1 + hard_side_bias * (0.5 - predicted_mean))
+    #
+    # so at the same variance, harder samples (lower mean reward) score higher.
+    # Samples with predicted mean outside [dead_zone_low, dead_zone_high] are
+    # zeroed out — under GRPO they produce no gradient (advantage collapses to
+    # 0 when all rollouts agree), so selecting them wastes budget.
+    asymmetric_utility_enabled: bool = False
+    hard_side_bias: float = 0.5          # α in (1 + α*(0.5 - mean))
+    asymmetric_dead_zone_low: float = 0.05
+    asymmetric_dead_zone_high: float = 0.95
+
     # --- Image Grounding Score (IGS) ---
     # Measures multimodal dependency: ratio of reward variance WITH image to
     # variance WITHOUT image.  High IGS means the image is essential for
@@ -158,6 +177,7 @@ class ClusterSelector(DataSelector):
         self._cluster_variances: Dict[int, float] = {}
         self._cluster_mean_rewards: Dict[int, float] = {}
         self._rep_variances: Dict[int, float] = {}  # global_idx -> individual rollout variance
+        self._rep_mean_rewards: Dict[int, float] = {}  # global_idx -> individual rollout mean reward
         self._last_selected_indices: List[int] = []
         self._selection_round: int = 0  # incremented each call to select()
 
@@ -523,6 +543,7 @@ class ClusterSelector(DataSelector):
             return parquet_i  # assume aligned when no JSON was provided
 
         self._rep_variances = {}
+        self._rep_mean_rewards = {}
         for i, parquet_ref_idx in enumerate(ref_indices):
             global_idx = to_npz(parquet_ref_idx)  # NPZ position
             if global_idx < 0:
@@ -533,6 +554,7 @@ class ClusterSelector(DataSelector):
             mean_r = float(ref_rewards[i].mean())
             var_r = float(ref_rewards[i].var())
             self._rep_variances[global_idx] = var_r  # individual variance per rep
+            self._rep_mean_rewards[global_idx] = mean_r  # individual mean reward per rep
             cluster_rewards[c_id].append(var_r)
             cluster_all_rewards[c_id].append(mean_r)
 
@@ -700,6 +722,45 @@ class ClusterSelector(DataSelector):
                 recency[dataset_idx] = latest_step
 
         # Cap to max_refs by keeping the most recently observed samples.
+        if len(results) > max_refs:
+            top_idxs = sorted(recency, key=lambda i: recency[i], reverse=True)[:max_refs]
+            results = {i: results[i] for i in top_idxs}
+
+        return results
+
+    def _compute_time_weighted_mean_rewards(self, current_step: int) -> Dict[int, float]:
+        """Compute time-decayed effective mean reward for all samples in the buffer.
+
+        Parallel to _compute_time_weighted_variances but averages raw rewards
+        instead of computing per-observation variance.  Used by the asymmetric
+        utility path in _select_interpolated so that DOTS can predict a
+        continuous "capability" signal (p ∈ [0, 1]) for every sample alongside
+        predicted variance.  Returned dict is keyed on the same NPZ indices and
+        capped to the same rollout_history_max_refs most-recent samples so it
+        aligns exactly with _compute_time_weighted_variances.
+        """
+        decay = self.cluster_config.rollout_history_decay_rate
+        max_refs = self.cluster_config.rollout_history_max_refs
+
+        results: Dict[int, float] = {}
+        recency: Dict[int, int] = {}
+
+        for dataset_idx, history in self._rollout_buffer.items():
+            if not history:
+                continue
+            total_w = 0.0
+            weighted_mean = 0.0
+            latest_step = 0
+            for t, rewards in history:
+                w = float(np.exp(-decay * max(0, current_step - t)))
+                m = float(np.mean(rewards))
+                weighted_mean += w * m
+                total_w += w
+                latest_step = max(latest_step, t)
+            if total_w > 1e-12:
+                results[dataset_idx] = weighted_mean / total_w
+                recency[dataset_idx] = latest_step
+
         if len(results) > max_refs:
             top_idxs = sorted(recency, key=lambda i: recency[i], reverse=True)[:max_refs]
             results = {i: results[i] for i in top_idxs}
@@ -1040,11 +1101,25 @@ class ClusterSelector(DataSelector):
         # training trajectory, not just the fixed REPR medoids.
         # Fall back to REPR medoids when the buffer is empty (first round before
         # any training steps have been recorded).
+        # Whether to also build a parallel mean-reward reference array so we can
+        # form the asymmetric utility (see ClusterSelectorConfig.asymmetric_utility_enabled).
+        asym = self.cluster_config.asymmetric_utility_enabled
+        ref_mean_rewards = None
+
         if (self.cluster_config.use_rollout_history and self._rollout_buffer):
             tw_vars = self._compute_time_weighted_variances(self._current_training_step)
             if tw_vars:
                 ref_indices = np.array(list(tw_vars.keys()))
                 ref_variances = np.array(list(tw_vars.values()), dtype=np.float32)
+                if asym:
+                    tw_means = self._compute_time_weighted_mean_rewards(
+                        self._current_training_step
+                    )
+                    # tw_means is keyed on the same dataset_idx set as tw_vars; align by order.
+                    ref_mean_rewards = np.array(
+                        [tw_means.get(int(i), 0.0) for i in ref_indices],
+                        dtype=np.float32,
+                    )
                 print(f"[ClusterSelector] DOTS reference: {len(ref_indices)} samples "
                       f"from rollout history (step={self._current_training_step})")
             else:
@@ -1053,6 +1128,13 @@ class ClusterSelector(DataSelector):
                     self._rep_variances.get(idx, self._cluster_variances.get(c_id, 0.0))
                     for idx, c_id in zip(self._rep_indices, self._rep_cluster_ids)
                 ], dtype=np.float32)
+                if asym:
+                    ref_mean_rewards = np.array([
+                        self._rep_mean_rewards.get(
+                            idx, self._cluster_mean_rewards.get(c_id, 0.5)
+                        )
+                        for idx, c_id in zip(self._rep_indices, self._rep_cluster_ids)
+                    ], dtype=np.float32)
         else:
             # Default path: fixed REPR medoids with individual per-rep variances.
             ref_indices = np.array(self._rep_indices)
@@ -1060,11 +1142,56 @@ class ClusterSelector(DataSelector):
                 self._rep_variances.get(global_idx, self._cluster_variances.get(c_id, 0.0))
                 for global_idx, c_id in zip(self._rep_indices, self._rep_cluster_ids)
             ], dtype=np.float32)
+            if asym:
+                ref_mean_rewards = np.array([
+                    self._rep_mean_rewards.get(
+                        global_idx, self._cluster_mean_rewards.get(c_id, 0.5)
+                    )
+                    for global_idx, c_id in zip(self._rep_indices, self._rep_cluster_ids)
+                ], dtype=np.float32)
 
         if ref_variances.sum() == 0:
             return self._select_weighted(budget)
 
         predicted_var = self._dots_interpolate(ref_indices, ref_variances)
+
+        # Asymmetric utility: reweight by predicted mean reward so that at equal
+        # variance, harder (lower-mean) samples are preferred.  Zeroes out
+        # samples near p=0 or p=1, which produce no GRPO gradient.
+        if asym and ref_mean_rewards is not None:
+            predicted_mean = self._dots_interpolate(ref_indices, ref_mean_rewards)
+            # Numerical safety: DOTS is a similarity-weighted average of values
+            # already in [0,1], so predictions should be too, but clip defensively.
+            predicted_mean = np.clip(predicted_mean, 0.0, 1.0)
+            alpha = float(self.cluster_config.hard_side_bias)
+            utility = predicted_var * (1.0 + alpha * (0.5 - predicted_mean))
+            # Dead-zone: samples where the model is always right or always wrong
+            # yield zero GRPO advantage — spending budget on them is wasted.
+            low = float(self.cluster_config.asymmetric_dead_zone_low)
+            high = float(self.cluster_config.asymmetric_dead_zone_high)
+            utility[predicted_mean < low] = 0.0
+            utility[predicted_mean > high] = 0.0
+            # Floor at 0 in case α > 1 pushes any term negative.
+            utility = np.maximum(utility, 0.0).astype(np.float32)
+
+            n_alive = int((utility > 0).sum())
+            mean_p_alive = (
+                float(predicted_mean[utility > 0].mean()) if n_alive > 0 else 0.0
+            )
+            print(
+                f"[ClusterSelector] asymmetric utility: α={alpha:.2f}, "
+                f"dead_zone=[{low:.2f},{high:.2f}], "
+                f"{n_alive}/{len(utility)} samples alive, "
+                f"mean p̂ (alive)={mean_p_alive:.3f}"
+            )
+
+            if utility.sum() == 0:
+                # Nothing in the alive zone — fall back to pure variance so we
+                # still return a well-formed selection rather than crashing.
+                print("[ClusterSelector] asymmetric utility: no alive samples, "
+                      "falling back to predicted_var")
+            else:
+                predicted_var = utility
 
         if not self.cluster_config.dots_diversity:
             # Global top-k: pure ranking by predicted variance

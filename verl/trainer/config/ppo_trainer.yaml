@@ -219,6 +219,12 @@ data_selection:
     igs_enabled: false
     igs_weight: 1.0
 
+    # --- Asymmetric utility (hard-side bias) ---
+    asymmetric_utility_enabled: false
+    hard_side_bias: 0.5
+    asymmetric_dead_zone_low: 0.05
+    asymmetric_dead_zone_high: 0.95
+
     # Path to the JSON/JSONL used to build the cluster embeddings (e.g.
     # VLAA-Thinking-GRPO-25K_train_90_100.json).  REQUIRED when the NPZ was
     # built from this file and the training parquet has a different row ordering
