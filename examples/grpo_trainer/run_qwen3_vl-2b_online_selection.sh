@@ -159,7 +159,23 @@ GLOBAL_BUDGET_PCT=${GLOBAL_BUDGET_PCT:-10.0}
 # fresher policy-state observations from neighbouring samples.
 REROLL_MEDOIDS=${REROLL_MEDOIDS:-false}
 
-EXP_NAME="v3_k200_r3_global10_${EXP_SUFFIX}"
+# --- Discovery cadence ---
+# Per-round budget = how many *new* samples to add per reselection (with the
+# exclude_already_selected mask in v3, this is the literal new-unique increment).
+# RESELECT_INTERVAL = how many training steps between reselections.
+# At batch_size=128 the natural unit is one batch.  Defaults below: pick one
+# fresh batch every step until the global cap is hit (~17 rounds for 10% of
+# 22k = 2.2k unique samples), then frozen reweight takes over for the rest of
+# training.
+SELECTION_BUDGET_PCT=${SELECTION_BUDGET_PCT:-0.58}   # ~128 samples on 22k dataset
+RESELECT_INTERVAL=${RESELECT_INTERVAL:-1}
+EXCLUDE_ALREADY_SELECTED=${EXCLUDE_ALREADY_SELECTED:-true}
+
+# Buffer cap: 0 = unlimited (rely on rollout_history_max_age pruning).  Older
+# values like 2000 throw away recent observations the trainer already paid for.
+ROLLOUT_HISTORY_MAX_REFS=${ROLLOUT_HISTORY_MAX_REFS:-0}
+
+EXP_NAME="v3_k200_r3_perRound${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,3,4,5"} \
@@ -175,8 +191,8 @@ python3 -m verl.trainer.main_ppo \
     data.image_key=images \
     data_selection.method=cluster \
     data_selection.reselect_schedule=step \
-    data_selection.reselect_interval=18\
-    data_selection.selection_budget_pct=10.0 \
+    data_selection.reselect_interval=$RESELECT_INTERVAL \
+    data_selection.selection_budget_pct=$SELECTION_BUDGET_PCT \
     data_selection.global_budget_pct=$GLOBAL_BUDGET_PCT \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
     data_selection.cluster.dataset_json_file=$DATASET_JSON \
@@ -193,7 +209,9 @@ python3 -m verl.trainer.main_ppo \
     data_selection.cluster.use_rollout_history=$USE_ROLLOUT_HISTORY \
     data_selection.cluster.rollout_history_decay_rate=0.05 \
     data_selection.cluster.rollout_history_max_age=500 \
-    data_selection.cluster.rollout_history_max_refs=2000 \
+    data_selection.cluster.rollout_history_max_refs=$ROLLOUT_HISTORY_MAX_REFS \
+    data_selection.cluster.exclude_already_selected=$EXCLUDE_ALREADY_SELECTED \
+    data_selection.cluster.reroll_medoids=$REROLL_MEDOIDS \
     data_selection.cluster.exploration_enabled=true \
     data_selection.cluster.exploration_pct=5.0 \
     data_selection.cluster.exploration_pct_base=$EXPLORATION_PCT_BASE \

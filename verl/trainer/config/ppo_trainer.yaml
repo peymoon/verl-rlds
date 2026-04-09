@@ -210,7 +210,18 @@ data_selection:
     use_rollout_history: false
     rollout_history_decay_rate: 0.05   # λ: higher = faster decay of old observations
     rollout_history_max_age: 500       # discard entries older than this many steps
-    rollout_history_max_refs: 2000     # cap reference set size passed to DOTS
+    rollout_history_max_refs: 0        # cap reference set size passed to DOTS (0 = unlimited; rely on age pruning only)
+
+    # --- Discovery / freeze behaviour ---
+    # Exclude samples already in the cumulative `_ever_selected_set` from
+    # interpolated top-K candidates so each pre-freeze round adds `budget` brand
+    # new uniques (selection without replacement).  Required for the global
+    # budget cap to actually correspond to per-round budget × n_rounds.
+    exclude_already_selected: true
+    # When false, medoid (REPR) reference rollouts only fire on round 0; later
+    # rounds reuse the rollout-history buffer instead of re-rolling the same
+    # medoids.  Saves a substantial amount of inference compute.
+    reroll_medoids: false
 
     # --- Exploration rollouts ---
     # Periodically include a small random subset of unselected samples to
