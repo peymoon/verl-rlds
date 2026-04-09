@@ -133,7 +133,26 @@ class ClusterSelectorConfig:
     use_rollout_history: bool = False
     rollout_history_decay_rate: float = 0.05   # λ in exp(-λ * Δstep)
     rollout_history_max_age: int = 500          # discard entries older than this
-    rollout_history_max_refs: int = 2000        # cap reference set size for DOTS
+    # Cap on reference-set size for DOTS.  Set to 0 to disable the cap entirely
+    # and use the full age-pruned buffer (recommended — there is no reason to
+    # throw away recent observations the trainer already paid to compute).
+    rollout_history_max_refs: int = 0
+
+    # --- Discovery / freeze behaviour ---
+    # When True, samples already in the cumulative `_ever_selected_set` are
+    # excluded from the candidate pool inside _select_interpolated.  This makes
+    # each pre-freeze round add `budget` *new* unique samples instead of mostly
+    # reselecting the same top-K.  Combined with a small per-round budget +
+    # global_budget_pct, this implements selection-without-replacement: the
+    # cumulative unique count rises by exactly `budget` per round until the
+    # global cap freezes the pool.
+    exclude_already_selected: bool = True
+
+    # When False, medoid (REPR) reference rollouts only fire on round 0.
+    # Subsequent rounds reuse the rollout-history buffer accumulated from
+    # training-step rewards instead of re-rolling the same fixed medoids.
+    # Saves a substantial amount of inference compute per round.
+    reroll_medoids: bool = False
 
     # Path to the JSONL/JSON source file that was used to build the cluster
     # embeddings (e.g. VLAA-Thinking-GRPO-25K_train_90_100.json).  Required
@@ -520,6 +539,14 @@ class ClusterSelector(DataSelector):
     def get_reference_indices(self) -> List[int]:
         if self._selection_frozen:
             return []
+        # When reroll_medoids is False, only roll out the fixed medoids on
+        # round 0 (cold start).  Subsequent rounds rely on the rollout-history
+        # buffer accumulated from training-step rewards, which already covers
+        # the full policy trajectory and is much cheaper than re-running the
+        # same medoid set every reselection round.
+        if (self._selection_round > 0
+                and not self.cluster_config.reroll_medoids):
+            return []
         # _rep_indices are in NPZ order. Remap to parquet order before returning
         # so the trainer's Subset(dataset, ref_indices) accesses the correct rows.
         return self._remap_npz_to_dataset(self._rep_indices)
@@ -728,7 +755,8 @@ class ClusterSelector(DataSelector):
                 recency[dataset_idx] = latest_step
 
         # Cap to max_refs by keeping the most recently observed samples.
-        if len(results) > max_refs:
+        # max_refs <= 0 disables the cap entirely (use the full age-pruned buffer).
+        if max_refs > 0 and len(results) > max_refs:
             top_idxs = sorted(recency, key=lambda i: recency[i], reverse=True)[:max_refs]
             results = {i: results[i] for i in top_idxs}
 
@@ -767,7 +795,7 @@ class ClusterSelector(DataSelector):
                 results[dataset_idx] = weighted_mean / total_w
                 recency[dataset_idx] = latest_step
 
-        if len(results) > max_refs:
+        if max_refs > 0 and len(results) > max_refs:
             top_idxs = sorted(recency, key=lambda i: recency[i], reverse=True)[:max_refs]
             results = {i: results[i] for i in top_idxs}
 
@@ -1050,6 +1078,10 @@ class ClusterSelector(DataSelector):
             ).tolist()
 
         # Build DOTS reference set from rollout history, same as _select_interpolated.
+        # Also build a parallel mean-reward reference when asymmetric utility is on,
+        # so the frozen-pool reweight applies the same hard-side bias as discovery.
+        asym = self.cluster_config.asymmetric_utility_enabled
+        ref_mean_rewards = None
         has_refs = False
         if self.cluster_config.use_rollout_history and self._rollout_buffer:
             tw_vars = self._compute_time_weighted_variances(self._current_training_step)
@@ -1057,6 +1089,14 @@ class ClusterSelector(DataSelector):
                 ref_indices = np.array(list(tw_vars.keys()))
                 ref_variances = np.array(list(tw_vars.values()), dtype=np.float32)
                 has_refs = True
+                if asym:
+                    tw_means = self._compute_time_weighted_mean_rewards(
+                        self._current_training_step
+                    )
+                    ref_mean_rewards = np.array(
+                        [tw_means.get(int(i), 0.5) for i in ref_indices],
+                        dtype=np.float32,
+                    )
                 print(f"[ClusterSelector] Frozen reweight DOTS reference: "
                       f"{len(ref_indices)} samples from rollout history "
                       f"(step={self._current_training_step})")
@@ -1085,12 +1125,35 @@ class ClusterSelector(DataSelector):
         pool_arr = np.array(pool)
         variances = predicted_var_all[pool_arr]
 
-        # Floor: 5% of max predicted variance. Prevents starvation so the
-        # model revisits "mastered" samples occasionally (they might become
-        # informative again after further policy updates).
-        max_var = variances.max()
-        floor = max(max_var * 0.05, 1e-8)
-        weights = np.maximum(variances, floor)
+        # Asymmetric utility: at equal predicted variance, prefer harder samples
+        # (lower predicted mean reward).  Mirrors the same reweight applied in
+        # _select_interpolated so the frozen-pool phase stays consistent with
+        # the discovery phase.  Samples in the dead zone (always-right or
+        # always-wrong) are zeroed out — they yield no GRPO gradient.
+        if asym and ref_mean_rewards is not None:
+            predicted_mean_all = self._dots_interpolate(ref_indices, ref_mean_rewards)
+            predicted_mean = np.clip(predicted_mean_all[pool_arr], 0.0, 1.0)
+            alpha = float(self.cluster_config.hard_side_bias)
+            utility = variances * (1.0 + alpha * (0.5 - predicted_mean))
+            low = float(self.cluster_config.asymmetric_dead_zone_low)
+            high = float(self.cluster_config.asymmetric_dead_zone_high)
+            utility[predicted_mean < low] = 0.0
+            utility[predicted_mean > high] = 0.0
+            utility = np.maximum(utility, 0.0).astype(np.float32)
+            score = utility
+        else:
+            score = variances
+
+        # Floor: 5% of max score. Prevents starvation so the model revisits
+        # "mastered" samples occasionally (they might become informative again
+        # after further policy updates).
+        max_score = float(score.max()) if score.size else 0.0
+        if max_score <= 0.0:
+            # Asymmetric mask wiped everything out — fall back to raw variance.
+            score = variances
+            max_score = float(score.max()) if score.size else 0.0
+        floor = max(max_score * 0.05, 1e-8)
+        weights = np.maximum(score, floor)
         weights /= weights.sum()
 
         # Sample with replacement — high-variance samples appear multiple times.
@@ -1315,6 +1378,36 @@ class ClusterSelector(DataSelector):
                       "falling back to predicted_var")
             else:
                 predicted_var = utility
+
+        # --- Exclude already-selected samples ---
+        # Without this, top-K selection keeps re-picking the same high-variance
+        # cluster every round, so cumulative unique grows very slowly and the
+        # per-round budget is mostly wasted on re-selecting the same prompts.
+        # Masking already-selected samples turns each pre-freeze round into a
+        # discovery step that adds `budget` brand-new unique samples to the
+        # pool — i.e. selection without replacement.  After global_budget_pct
+        # is hit, _select_frozen_reweight takes over and is allowed to pick
+        # repeats inside the frozen pool.
+        if (self.cluster_config.exclude_already_selected
+                and self._ever_selected_set):
+            mask = np.zeros(predicted_var.shape[0], dtype=bool)
+            ever = np.fromiter(self._ever_selected_set, dtype=np.int64,
+                               count=len(self._ever_selected_set))
+            ever = ever[(ever >= 0) & (ever < mask.shape[0])]
+            mask[ever] = True
+            n_excluded = int(mask.sum())
+            if n_excluded > 0:
+                # Use a copy so we don't mutate any caller-shared array.
+                predicted_var = predicted_var.copy()
+                predicted_var[mask] = 0.0
+                n_remaining = int((predicted_var > 0).sum())
+                print(f"[ClusterSelector] discovery mask: excluded "
+                      f"{n_excluded} already-selected, "
+                      f"{n_remaining} candidates remaining")
+                if n_remaining == 0:
+                    print("[ClusterSelector] discovery mask: pool exhausted "
+                          "before global cap; returning empty selection")
+                    return []
 
         if not self.cluster_config.dots_diversity:
             # Global top-k: pure ranking by predicted variance
