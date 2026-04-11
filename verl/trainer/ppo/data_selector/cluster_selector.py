@@ -20,7 +20,7 @@ model improves.
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -205,7 +205,34 @@ class ClusterSelector(DataSelector):
         self._selection_jaccard: float = 0.0
         self._selection_history: List[set] = []  # all rounds' NPZ index sets
         self._per_cluster_coverage: Dict[int, int] = {}  # cluster_id -> times selected
-        self._ever_selected_set: set = set()  # running union of all NPZ indices ever selected
+
+        # --- Annotation budget tracking ---
+        # _ever_selected_set is the union of EVERY sample for which the trainer
+        # has consumed ground-truth (rollout reward computation).  It is the
+        # quantity that the global_budget_pct cap is enforced against.  Three
+        # disjoint sources contribute, tracked separately so we can report a
+        # per-source breakdown to wandb:
+        #   training    — samples returned from select() and trained on
+        #   medoid      — REPR rollouts run via update_rewards() (round 0 only
+        #                 when reroll_medoids=False)
+        #   exploration — random rollouts run via update_exploration_rewards()
+        # _ever_selected_set is maintained as the union of these three.
+        self._ever_selected_train: set = set()
+        self._ever_selected_medoid: set = set()
+        self._ever_selected_exploration: set = set()
+        self._ever_selected_set: set = set()
+        # Per-round snapshot of (round, train, medoid, exploration) for the
+        # cumulative budget breakdown stacked-area chart in wandb.
+        self._budget_history: List[Tuple[int, int, int, int]] = []
+
+        # Cache of the most recent per-sample DOTS-predicted mean reward
+        # (only populated when asymmetric_utility_enabled=True).  Used by the
+        # wandb visualization to colour selected samples by predicted difficulty.
+        self._last_predicted_mean: Optional[np.ndarray] = None
+        self._last_predicted_var: Optional[np.ndarray] = None
+        # 2D PCA projection of the embeddings, computed once at initialize().
+        # Used for the selection-overlay scatter plot.
+        self._embedding_2d: Optional[np.ndarray] = None
 
         # --- Exploration rollouts ---
         self._exploration_indices: List[int] = []  # NPZ indices for next exploration
@@ -273,6 +300,26 @@ class ClusterSelector(DataSelector):
 
         if self.cluster_config.strategy in ("scored", "interpolated"):
             self._compute_static_scores()
+
+        # Cheap one-shot 2D PCA projection of the embeddings for the wandb
+        # selection-overlay scatter plot.  Done once because the embeddings are
+        # static; subsequent rounds just index into _embedding_2d.
+        try:
+            X = self._embeddings.astype(np.float32)
+            mu = X.mean(axis=0, keepdims=True)
+            Xc = X - mu
+            # Use SVD on a row sample if the dataset is huge — fitting on 5k
+            # rows is more than enough for a 2D projection.
+            if Xc.shape[0] > 5000:
+                idx = self._rng.choice(Xc.shape[0], size=5000, replace=False)
+                _, _, Vt = np.linalg.svd(Xc[idx], full_matrices=False)
+            else:
+                _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+            self._embedding_2d = (Xc @ Vt[:2].T).astype(np.float32)
+        except Exception as e:
+            print(f"[ClusterSelector] PCA projection failed ({e}); "
+                  f"selection scatter plot will be disabled.")
+            self._embedding_2d = None
 
         print(f"[ClusterSelector] Ready: {len(set(self._cluster_ids))} clusters, "
               f"{len(self._rep_indices)} representatives")
@@ -577,6 +624,7 @@ class ClusterSelector(DataSelector):
 
         self._rep_variances = {}
         self._rep_mean_rewards = {}
+        medoid_npz_used: List[int] = []
         for i, parquet_ref_idx in enumerate(ref_indices):
             global_idx = to_npz(parquet_ref_idx)  # NPZ position
             if global_idx < 0:
@@ -590,6 +638,7 @@ class ClusterSelector(DataSelector):
             self._rep_mean_rewards[global_idx] = mean_r  # individual mean reward per rep
             cluster_rewards[c_id].append(var_r)
             cluster_all_rewards[c_id].append(mean_r)
+            medoid_npz_used.append(int(global_idx))
 
             # Seed the rollout buffer with REPR rollouts so round 0 already has
             # reference points. Subsequent REPR rounds update with fresh entries.
@@ -599,6 +648,14 @@ class ClusterSelector(DataSelector):
                 self._rollout_buffer[global_idx].append(
                     (self._current_training_step, ref_rewards[i].copy())
                 )
+
+        # Account medoid rollouts against the global annotation budget.
+        # These samples consumed ground-truth reward computation and should
+        # count toward global_budget_pct just like training samples do.
+        if medoid_npz_used:
+            new_medoid = set(medoid_npz_used) - self._ever_selected_set
+            self._ever_selected_medoid |= new_medoid
+            self._ever_selected_set |= new_medoid
 
         self._cluster_variances = {}
         self._cluster_mean_rewards = {}
@@ -878,6 +935,7 @@ class ClusterSelector(DataSelector):
             explore_rewards = explore_rewards.reshape(-1, 1)
 
         n_added = 0
+        explore_npz_used: List[int] = []
         for i, parquet_idx in enumerate(explore_indices):
             npz_idx = (self._dataset_to_npz.get(int(parquet_idx), -1)
                        if self._dataset_to_npz is not None else parquet_idx)
@@ -889,8 +947,16 @@ class ClusterSelector(DataSelector):
                 (self._current_training_step, explore_rewards[i].copy())
             )
             n_added += 1
+            explore_npz_used.append(int(npz_idx))
 
-        print(f"[ClusterSelector] Exploration: added {n_added} samples to history buffer")
+        # Account exploration rollouts against the global annotation budget.
+        if explore_npz_used:
+            new_explore = set(explore_npz_used) - self._ever_selected_set
+            self._ever_selected_exploration |= new_explore
+            self._ever_selected_set |= new_explore
+
+        print(f"[ClusterSelector] Exploration: added {n_added} samples to history buffer "
+              f"({len(explore_npz_used)} new uniques counted against global budget)")
 
     # ------------------------------------------------------------------
     # Image Grounding Score (IGS)
@@ -1005,7 +1071,10 @@ class ClusterSelector(DataSelector):
             self._selection_jaccard = 0.0
         self._prev_selected_set = current_set
         self._selection_history.append(current_set)
-        self._ever_selected_set |= current_set
+        # Account training samples against the global annotation budget.
+        new_train = current_set - self._ever_selected_set
+        self._ever_selected_train |= new_train
+        self._ever_selected_set |= new_train
 
         # Track per-cluster selection frequency
         for idx in npz_indices:
@@ -1038,6 +1107,12 @@ class ClusterSelector(DataSelector):
                       f"this pool using training reward variance.")
 
         self._last_selected_indices = indices
+        self._budget_history.append((
+            self._selection_round,
+            len(self._ever_selected_train),
+            len(self._ever_selected_medoid),
+            len(self._ever_selected_exploration),
+        ))
         print(f"[ClusterSelector] Selected {len(indices)} samples "
               f"(strategy={strategy}, budget={budget})")
         return indices
@@ -1340,6 +1415,9 @@ class ClusterSelector(DataSelector):
             return self._select_weighted(budget)
 
         predicted_var = self._dots_interpolate(ref_indices, ref_variances)
+        # Cache the raw predictions so visualizations can colour selected
+        # samples by predicted difficulty / informativeness.
+        self._last_predicted_var = predicted_var.copy()
 
         # Asymmetric utility: reweight by predicted mean reward so that at equal
         # variance, harder (lower-mean) samples are preferred.  Zeroes out
@@ -1349,6 +1427,7 @@ class ClusterSelector(DataSelector):
             # Numerical safety: DOTS is a similarity-weighted average of values
             # already in [0,1], so predictions should be too, but clip defensively.
             predicted_mean = np.clip(predicted_mean, 0.0, 1.0)
+            self._last_predicted_mean = predicted_mean.copy()
             alpha = float(self.cluster_config.hard_side_bias)
             utility = predicted_var * (1.0 + alpha * (0.5 - predicted_mean))
             # Dead-zone: samples where the model is always right or always wrong
@@ -1673,6 +1752,25 @@ class ClusterSelector(DataSelector):
             metrics["data_selection/cumulative_unique_selected"] = float(len(self._ever_selected_set))
             metrics["data_selection/selection_round"] = float(self._selection_round)
 
+            # Per-source budget breakdown — every sample where the trainer
+            # consumed ground truth is bucketed by *why* it was annotated.
+            # The three sets are maintained as disjoint (each new sample is
+            # added to exactly one source bucket on first observation), so
+            # they sum to cumulative_unique_selected.
+            metrics["data_selection/budget_breakdown/training"] = float(
+                len(self._ever_selected_train))
+            metrics["data_selection/budget_breakdown/medoid"] = float(
+                len(self._ever_selected_medoid))
+            metrics["data_selection/budget_breakdown/exploration"] = float(
+                len(self._ever_selected_exploration))
+            n_total = max(len(self._ever_selected_set), 1)
+            metrics["data_selection/budget_breakdown/training_pct"] = (
+                100.0 * len(self._ever_selected_train) / n_total)
+            metrics["data_selection/budget_breakdown/medoid_pct"] = (
+                100.0 * len(self._ever_selected_medoid) / n_total)
+            metrics["data_selection/budget_breakdown/exploration_pct"] = (
+                100.0 * len(self._ever_selected_exploration) / n_total)
+
             # Report global budget cap utilization if enabled
             if self.config.global_budget_pct is not None:
                 global_max = max(1, int(len(self._embeddings) * self.config.global_budget_pct / 100.0))
@@ -1783,6 +1881,118 @@ class ClusterSelector(DataSelector):
                          f"(top {top_n}, colored by variance)")
             fig.tight_layout()
             images["data_selection/cluster_allocation"] = wandb.Image(fig)
+            plt.close(fig)
+
+        # --- Plot: Difficulty histogram of the most recently selected samples ---
+        # Uses the cached DOTS-predicted mean reward (only populated when
+        # asymmetric_utility_enabled=True), so this plot only appears in that mode.
+        if (self._prev_selected_set
+                and self._last_predicted_mean is not None):
+            sel = np.fromiter(self._prev_selected_set, dtype=np.int64,
+                              count=len(self._prev_selected_set))
+            sel = sel[(sel >= 0) & (sel < self._last_predicted_mean.shape[0])]
+            if sel.size > 0:
+                pm = self._last_predicted_mean[sel]
+                fig, ax = plt.subplots(figsize=(8, 3))
+                ax.hist(pm, bins=30, range=(0.0, 1.0),
+                        color="darkorange", alpha=0.85, edgecolor="black",
+                        linewidth=0.3)
+                ax.axvline(0.5, color="k", linestyle="--", alpha=0.4,
+                           label="frontier (0.5)")
+                low = self.cluster_config.asymmetric_dead_zone_low
+                high = self.cluster_config.asymmetric_dead_zone_high
+                ax.axvspan(0.0, low, color="grey", alpha=0.2,
+                           label="dead zone")
+                ax.axvspan(high, 1.0, color="grey", alpha=0.2)
+                ax.set_xlabel("DOTS-predicted mean reward (0=hard, 1=easy)")
+                ax.set_ylabel("# Samples")
+                ax.set_title(f"Round {self._selection_round}: Difficulty "
+                             f"distribution of selected samples (n={sel.size})")
+                ax.set_xlim(0, 1)
+                ax.legend(fontsize=7, loc="upper right")
+                fig.tight_layout()
+                images["data_selection/selected_difficulty"] = wandb.Image(fig)
+                plt.close(fig)
+
+        # --- Plot: 2D PCA scatter of selected vs unselected samples ---
+        # Uses the cached PCA projection (computed once at initialize()) and
+        # colours selected points by predicted mean reward when available, else
+        # by predicted variance.  Background is downsampled for legibility.
+        if (self._embedding_2d is not None
+                and self._prev_selected_set):
+            E = self._embedding_2d
+            sel = np.fromiter(self._prev_selected_set, dtype=np.int64,
+                              count=len(self._prev_selected_set))
+            sel = sel[(sel >= 0) & (sel < E.shape[0])]
+            n_bg = min(8000, E.shape[0])
+            if n_bg < E.shape[0]:
+                bg_idx = self._rng.choice(E.shape[0], size=n_bg, replace=False)
+            else:
+                bg_idx = np.arange(E.shape[0])
+
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ax.scatter(E[bg_idx, 0], E[bg_idx, 1], s=2, c="lightgrey",
+                       alpha=0.4, label="unselected (bg sample)")
+
+            if sel.size > 0:
+                color_vals = None
+                cbar_label = None
+                if self._last_predicted_mean is not None:
+                    color_vals = self._last_predicted_mean[sel]
+                    cmap = "RdYlGn"
+                    cbar_label = "predicted mean reward (1=easy)"
+                elif self._last_predicted_var is not None:
+                    color_vals = self._last_predicted_var[sel]
+                    cmap = "viridis"
+                    cbar_label = "predicted variance"
+                if color_vals is not None:
+                    sc = ax.scatter(E[sel, 0], E[sel, 1], s=10, c=color_vals,
+                                    cmap=cmap, edgecolors="black",
+                                    linewidths=0.2)
+                    cb = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
+                    cb.set_label(cbar_label, fontsize=8)
+                else:
+                    ax.scatter(E[sel, 0], E[sel, 1], s=10, c="crimson",
+                               edgecolors="black", linewidths=0.2,
+                               label="selected")
+                    ax.legend(fontsize=8, loc="best")
+
+            ax.set_xlabel("PC1")
+            ax.set_ylabel("PC2")
+            ax.set_title(f"Round {self._selection_round}: Selected samples in "
+                         f"embedding space (n_selected={sel.size})")
+            fig.tight_layout()
+            images["data_selection/selection_scatter"] = wandb.Image(fig)
+            plt.close(fig)
+
+        # --- Plot: Cumulative annotation budget by source over time ---
+        if len(self._budget_history) >= 1:
+            hist = np.array(self._budget_history, dtype=np.int64)
+            rounds = hist[:, 0]
+            train = hist[:, 1]
+            medoid = hist[:, 2]
+            explore = hist[:, 3]
+
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            ax.stackplot(rounds, train, medoid, explore,
+                         labels=["training", "medoid", "exploration"],
+                         colors=["#4c72b0", "#dd8452", "#55a868"],
+                         alpha=0.85)
+
+            if self.config.global_budget_pct is not None:
+                global_max = max(1, int(
+                    len(self._embeddings) * self.config.global_budget_pct / 100.0))
+                ax.axhline(global_max, color="red", linestyle="--",
+                           linewidth=1.0,
+                           label=f"global cap ({self.config.global_budget_pct:g}%)")
+
+            ax.set_xlabel("Selection round")
+            ax.set_ylabel("Cumulative unique samples")
+            ax.set_title("Annotation budget breakdown by source")
+            ax.legend(fontsize=8, loc="upper left")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            images["data_selection/budget_breakdown"] = wandb.Image(fig)
             plt.close(fig)
 
         # --- Plot 2: Overlap Jaccard history ---

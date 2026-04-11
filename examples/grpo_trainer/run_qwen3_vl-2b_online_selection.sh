@@ -90,8 +90,61 @@ set -x
 #       data_selection.cluster.rollout_history_decay_rate=0.1 \
 #       trainer.total_epochs=20
 
+print_help() {
+        cat <<'EOF'
+Usage:
+    run_qwen3_vl-2b_online_selection.sh [ENGINE] [CLUSTER_ARRAYS] [VARIANT] [DATASET_JSON] [HYDRA_OVERRIDES...]
+
+Positional args:
+    ENGINE          vllm | sglang (default: vllm)
+    CLUSTER_ARRAYS  path to cluster_arrays.npz
+                                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz)
+    VARIANT         interpolated_weighted | interpolated (default: interpolated_weighted)
+    DATASET_JSON    JSON/JSONL used to build cluster embeddings (required for NPZ↔parquet remap)
+                                    (default: /workspace/rl_data_selection/data/VLAA-Thinking/VLAA-Thinking-GRPO-25K_train_90_100.json)
+
+Important selector method options (from cluster_selector.py):
+    data_selection.cluster.strategy:
+        top_clusters | weighted | scored | interpolated
+
+    data_selection.cluster.within_cluster_method:
+        centroid_nearest | mmd
+
+    data_selection.cluster.representative_method:
+        medoid | centroid_nearest
+
+Variant behavior:
+    interpolated_weighted -> strategy=interpolated, dots_diversity=true,
+                                                     dots_diversity_use_composite_score=true,
+                                                     use_rollout_history=true
+    interpolated          -> strategy=interpolated, dots_diversity=true,
+                                                     dots_diversity_use_composite_score=false,
+                                                     use_rollout_history=false
+
+Common env vars:
+    GLOBAL_BUDGET_PCT, SELECTION_BUDGET_PCT, RESELECT_INTERVAL,
+    EXCLUDE_ALREADY_SELECTED, REROLL_MEDOIDS,
+    EXPLORATION_ENABLED, EXPLORATION_PCT, EXPLORATION_INTERVAL, EXPLORATION_PCT_BASE,
+    ASYMMETRIC_UTILITY, ASYMMETRIC_BIAS, ASYMMETRIC_DEAD_LOW, ASYMMETRIC_DEAD_HIGH,
+    ROLLOUT_HISTORY_MAX_REFS, CUDA_VISIBLE_DEVICES
+
+Examples:
+    bash run_qwen3_vl-2b_online_selection.sh
+    bash run_qwen3_vl-2b_online_selection.sh --help
+    GLOBAL_BUDGET_PCT=10.0 bash run_qwen3_vl-2b_online_selection.sh
+    bash run_qwen3_vl-2b_online_selection.sh vllm /path/cluster_arrays.npz interpolated /path/dataset.json \
+            data_selection.cluster.within_cluster_method=mmd \
+            data_selection.cluster.n_reps=4
+EOF
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+        print_help
+        exit 0
+fi
+
 ENGINE=${1:-vllm}
-CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz}
+CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz}
 VARIANT=${3:-interpolated_weighted}
 # Path to the JSON/JSONL that was used to build the cluster embeddings.
 # Required to correctly align NPZ row order with parquet row order — these
@@ -168,14 +221,29 @@ REROLL_MEDOIDS=${REROLL_MEDOIDS:-false}
 # 22k = 2.2k unique samples), then frozen reweight takes over for the rest of
 # training.
 SELECTION_BUDGET_PCT=${SELECTION_BUDGET_PCT:-0.58}   # ~128 samples on 22k dataset
-RESELECT_INTERVAL=${RESELECT_INTERVAL:-1}
+# Reselect every 4 training steps — every-step proved too aggressive: it
+# burns the global cap in ~17 steps (with budget 0.58% × 17 ≈ 10%) which
+# leaves the bulk of training in the frozen-reweight phase. Stretching the
+# discovery cadence to every 4 steps gives the policy time to actually
+# learn from the new samples before adding more, while the rollout-history
+# buffer continues to absorb training-batch rewards on every step.
+RESELECT_INTERVAL=${RESELECT_INTERVAL:-4}
 EXCLUDE_ALREADY_SELECTED=${EXCLUDE_ALREADY_SELECTED:-true}
+
+# --- Exploration ---
+# With exclude_already_selected=true the discovery mask already prevents
+# re-picking samples, so the original "diversify the buffer" rationale for
+# exploration is largely subsumed.  Disabled by default; set
+# EXPLORATION_ENABLED=true to re-enable for ablations.
+EXPLORATION_ENABLED=${EXPLORATION_ENABLED:-false}
+EXPLORATION_PCT=${EXPLORATION_PCT:-1.0}
+EXPLORATION_INTERVAL=${EXPLORATION_INTERVAL:-4}
 
 # Buffer cap: 0 = unlimited (rely on rollout_history_max_age pruning).  Older
 # values like 2000 throw away recent observations the trainer already paid for.
 ROLLOUT_HISTORY_MAX_REFS=${ROLLOUT_HISTORY_MAX_REFS:-0}
 
-EXP_NAME="v3_k200_r3_perRound${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
+EXP_NAME="v3_k50_r10_perRound${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,3,4,5"} \
@@ -196,8 +264,8 @@ python3 -m verl.trainer.main_ppo \
     data_selection.global_budget_pct=$GLOBAL_BUDGET_PCT \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
     data_selection.cluster.dataset_json_file=$DATASET_JSON \
-    data_selection.cluster.n_clusters=200 \
-    data_selection.cluster.n_reps=3 \
+    data_selection.cluster.n_clusters=50 \
+    data_selection.cluster.n_reps=10 \
     data_selection.cluster.strategy=interpolated \
     data_selection.cluster.within_cluster_method=centroid_nearest \
     data_selection.cluster.representative_method=medoid \
@@ -212,10 +280,10 @@ python3 -m verl.trainer.main_ppo \
     data_selection.cluster.rollout_history_max_refs=$ROLLOUT_HISTORY_MAX_REFS \
     data_selection.cluster.exclude_already_selected=$EXCLUDE_ALREADY_SELECTED \
     data_selection.cluster.reroll_medoids=$REROLL_MEDOIDS \
-    data_selection.cluster.exploration_enabled=true \
-    data_selection.cluster.exploration_pct=5.0 \
+    data_selection.cluster.exploration_enabled=$EXPLORATION_ENABLED \
+    data_selection.cluster.exploration_pct=$EXPLORATION_PCT \
     data_selection.cluster.exploration_pct_base=$EXPLORATION_PCT_BASE \
-    data_selection.cluster.exploration_interval=2 \
+    data_selection.cluster.exploration_interval=$EXPLORATION_INTERVAL \
     data_selection.cluster.igs_enabled=false \
     data_selection.cluster.igs_weight=1.0 \
     data_selection.cluster.asymmetric_utility_enabled=$ASYMMETRIC_UTILITY \
@@ -255,7 +323,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=3 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=170 \
     trainer.default_local_dir=/workspace/rl_data_selection/peyman/outputs/checkpoints/online_selection/${EXP_NAME} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     trainer.rollout_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME} \

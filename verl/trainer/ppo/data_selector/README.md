@@ -8,43 +8,63 @@ Standard verl GRPO training uses a static dataset: every epoch trains on the sam
 
 ## How It Works (End-to-End)
 
+The pipeline is structured around an **annotation budget**, not a compute
+budget: every sample for which the trainer consumes ground-truth (reference
+medoid rollouts, training rollouts, and exploration rollouts) is debited
+against a single global cap (`global_budget_pct`).  Selection runs in two
+phases — **discovery** (growing the annotated pool) and **frozen reweight**
+(redistributing compute inside the pool once the cap is hit).
+
 ```
 INITIALIZATION (once at startup)
   ├── Load cluster_arrays.npz (22K × 2048 Qwen3-VL embeddings, K=200 centroids, assignments)
   ├── Build NPZ↔parquet alignment map from dataset_json_file
   ├── Select medoid representatives: K × n_reps = 600 reference probes
-  └── Compute static geometry: transferability (inter-cluster cosine sim), density (intra-cluster Gaussian kernel)
+  ├── Compute static geometry: transferability (inter-cluster cosine sim), density (Gaussian kernel)
+  └── Compute 2-D PCA projection of embeddings (cached for wandb scatter plots)
 
-ROUND 0 (step 0) — Initial selection
-  ├── Reference rollouts: 600 medoids × 8 rollouts each → per-rep reward variance + mean reward
+ROUND 0 (step 0) — Cold start
+  ├── Reference rollouts: 600 medoids × 8 rollouts each → per-rep variance + mean reward
+  │   (these 600 samples are debited against the global budget)
   ├── Seed rollout history buffer with medoid observations
   ├── DOTS interpolate: predict variance for ALL 22K using 600 refs
-  │   (cosine-similarity-weighted average, τ=0.05, top_k=64)
-  ├── Optional: asymmetric utility reweighting (see below)
-  ├── Per-cluster allocation via softmax(composite_score / diversity_temp)
-  ├── Select top 10% (2,268 samples) by predicted variance within each cluster
-  └── Dataloader rebuilt with these 2,268 samples
+  ├── If asymmetric_utility_enabled: predict mean reward too and reweight
+  │   (utility = predicted_var × (1 + α × (0.5 − predicted_mean)), dead-zone clipped)
+  ├── Per-cluster softmax allocation over composite scores (var × transferability × 1/density)
+  ├── Select top `selection_budget_pct` % (e.g. 0.58% ≈ 128 samples) within each cluster
+  │   — the discovery mask `_ever_selected_set` excludes already-selected samples
+  └── Dataloader rebuilt with these new samples
 
-STEPS 1–17 — Train + accumulate signal
-  ├── Each step: train on 1 batch (128 samples from selected subset)
+STEPS 1..N — Train + accumulate signal (no medoid rollouts)
+  ├── Each step: train on 1 batch (128 samples from current selection)
   ├── GRPO rollouts → rewards → gradients → update policy
-  └── update_rollout_history: each batch's per-sample rewards → time-weighted buffer
-      Buffer grows: 600 medoids → ~2000 (capped at rollout_history_max_refs)
+  ├── update_rollout_history: each batch's per-sample rewards → time-weighted buffer
+  │   (buffer grows organically; rollout_history_max_refs=0 → no cap)
+  └── Every `reselect_interval` steps → DISCOVERY ROUND (see below)
 
-ROUND 1 (step 18) — Adaptive re-selection
-  ├── Reference rollouts: 600 medoids with UPDATED policy → new variance landscape
-  ├── DOTS reference set = rollout history buffer (~2000 time-weighted refs)
-  │   (recent observations weighted higher: w(t) = exp(-0.05 × Δstep))
-  ├── DOTS interpolate: predict variance for all 22K using enriched reference set
-  ├── Clusters that WERE hard → now learnable → variance rises → more budget
-  ├── Clusters that WERE learnable → now mastered → variance drops → less budget
-  └── New selection adapts to policy's evolved capability frontier
+DISCOVERY ROUND (every `reselect_interval` steps until cap is hit)
+  ├── Medoid rollouts SKIPPED (reroll_medoids=false; round-0 medoids only)
+  ├── DOTS reference set = entire rollout history buffer (organic, policy-tracking)
+  ├── DOTS interpolate variance + (optional) mean over the FULL 22K
+  ├── Discovery mask zeros out already-selected samples → top-k yields fresh uniques only
+  ├── Per-cluster allocation as before, top-n within each cluster
+  └── New batch of `selection_budget` brand-new samples is added to the pool
+      → debited against the global budget
 
-EXPLORATION (every other selection round)
-  └── 30 random un-selected samples rolled out → results enter buffer
-      → DOTS gains visibility into previously ignored regions
+GLOBAL CAP REACHED → SWITCH TO FROZEN REWEIGHT
+  ├── `_ever_selected_set` ≥ `global_budget_pct × N`  → freeze pool composition
+  ├── Subsequent reselection rounds:
+  │     • no medoid rollouts (saved compute)
+  │     • no exploration rollouts (saved compute)
+  │     • DOTS interpolate variance + mean over the frozen pool only
+  │     • multinomial-sample with replacement weighted by utility
+  └── Effective curriculum within the fixed pool — focus shifts to whichever
+      pool members are still in the policy's learning zone
 
-...repeats every 18 steps...
+EXPLORATION (optional, off by default)
+  └── With exclude_already_selected=true the discovery mask makes random
+      exploration largely redundant, so EXPLORATION_ENABLED=false in the
+      launch script.  Set to true for ablations.
 ```
 
 ## Architecture
@@ -100,20 +120,26 @@ These are the **active values** in the launch script `run_qwen3_vl-2b_online_sel
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `n_clusters` | **200** (was 50) | Fine-grained clustering — ~113 samples per cluster |
-| `n_reps` | **3** (was 10) | 3 medoids per cluster → 600 reference rollouts per round |
-| `reselect_interval` | **18** (was 10) | More training between reselections → richer buffer per round |
-| `selection_budget_pct` | 10% | ~2,268 samples from 22,675 pool |
+| `n_clusters` | 200 | Fine-grained clustering — ~113 samples per cluster |
+| `n_reps` | 3 | 3 medoids per cluster → 600 reference rollouts (round 0 only) |
+| `reselect_schedule` | `step` | Reselect on step boundaries, not epoch boundaries |
+| `reselect_interval` | **4** | Reselect every 4 training steps — every-step proved too aggressive (burned the cap in ~17 steps and left training stuck in frozen-reweight) |
+| `selection_budget_pct` | **0.58%** | ~128 samples per round (one batch). Small per-round budget = many discovery rounds before hitting the cap |
+| `global_budget_pct` | **10.0%** | Hard cap on cumulative unique annotated samples — fair comparison vs random 10% baseline |
+| `exclude_already_selected` | **`true`** | Discovery mask: each round adds exactly `selection_budget` brand-new uniques (no resampling) |
+| `reroll_medoids` | **`false`** | Medoid rollouts run once at round 0; later rounds rely on the rollout-history buffer |
 | `strategy` | `interpolated` | Per-sample variance prediction via DOTS |
 | `dots_diversity` | `true` | Per-cluster allocation with diversity guarantee |
-| `dots_diversity_temperature` | **0.5** (was 0.1) | Warmer allocation → more uniform budget across clusters |
+| `dots_diversity_temperature` | 0.5 | Warmer allocation → more uniform budget across clusters |
 | `dots_temperature` | 0.05 | Sharp DOTS interpolation — nearest refs dominate |
 | `dots_top_k` | 64 | Number of nearest references used per prediction |
-| `use_rollout_history` | `true` | Buffer grows from 600 medoids to 2000 refs |
+| `use_rollout_history` | `true` | Buffer grows organically from 600 medoids as training progresses |
 | `rollout_history_decay_rate` | 0.05 | Half-life ≈ 14 steps |
-| `exploration_enabled` | `true` | Random un-selected samples rolled out periodically |
-| `asymmetric_utility_enabled` | **`true`** (new) | Prefer harder samples at equal variance |
+| `rollout_history_max_refs` | **0** (unlimited) | No artificial cap; rely on `rollout_history_max_age` pruning instead. Older default of 2000 threw away recent observations the trainer had already paid for |
+| `exploration_enabled` | **`false`** | Disabled by default — discovery mask already prevents resampling, so the original "diversify the buffer" rationale is moot |
+| `asymmetric_utility_enabled` | `true` | Prefer harder samples at equal variance |
 | `hard_side_bias` | 0.5 | Mild bias toward hard side |
+| `asymmetric_dead_zone_low/high` | 0.05 / 0.95 | Zero out samples the policy already always-fails or always-passes |
 
 ## Quick Reference: Bash Parameters → Code
 
@@ -149,7 +175,9 @@ Every `data_selection.*` key in the bash script maps directly to a config field.
 | `data_selection.cluster.use_rollout_history` | `False` | `cluster_selector.py: update_rollout_history()` | When `True`, training-batch rollouts are accumulated into a time-weighted buffer and used as additional DOTS reference points alongside REPR medoids. See below. |
 | `data_selection.cluster.rollout_history_decay_rate` | `0.05` | `cluster_selector.py: _compute_time_weighted_variances()` | λ in `exp(-λ * Δstep)`. Higher = faster decay of old observations. |
 | `data_selection.cluster.rollout_history_max_age` | `500` | `cluster_selector.py: update_rollout_history()` | Entries older than this many training steps are discarded from the buffer. |
-| `data_selection.cluster.rollout_history_max_refs` | `2000` | `cluster_selector.py: _compute_time_weighted_variances()` | Maximum number of reference points passed to DOTS (keeps most recent). |
+| `data_selection.cluster.rollout_history_max_refs` | `0` | `cluster_selector.py: _compute_time_weighted_variances()` | Maximum number of reference points passed to DOTS (keeps most recent). `0` = unlimited (rely on `rollout_history_max_age` pruning). |
+| `data_selection.cluster.exclude_already_selected` | `true` | `cluster_selector.py: _select_interpolated()` | **Discovery mask.** When true, the per-sample interpolated top-k zeros out any sample already in `_ever_selected_set`. Each pre-freeze round therefore adds exactly `selection_budget` brand-new uniques (selection without replacement), so the global cap corresponds to `per_round_budget × n_rounds`. |
+| `data_selection.cluster.reroll_medoids` | `false` | `cluster_selector.py: get_reference_indices()` | When false, REPR medoid rollouts only fire on round 0; later rounds rely on the rollout-history buffer instead of re-rolling the same medoids. Saves a substantial amount of inference compute and avoids wasting global budget on medoids that the buffer already supersedes. |
 | `data_selection.cluster.dataset_json_file` | `None` | `cluster_selector.py: _build_alignment_from_json()` | **Required when NPZ and parquet have different row orderings.** Path to the JSON/JSONL used to build the cluster embeddings. The selector matches by `image` field to produce a bidirectional NPZ↔parquet index map. Without this, REPR rollouts and `select()` reference wrong parquet rows (silently incorrect selection). |
 | `data_selection.cluster.exploration_enabled` | `false` | `cluster_selector.py: get_exploration_indices()` | Enable exploration rollouts on random un-selected samples to break feedback loops |
 | `data_selection.cluster.exploration_pct` | `5.0` | `cluster_selector.py: get_selection_budget_for_exploration()` | Percentage of full dataset to explore each round |
@@ -279,29 +307,29 @@ effective_var[uid] = Σ_t w(t) × var(rewards_at_step_t) / Σ_t w(t)
 This means:
 - **Recent rollouts count most** — rewards from 10 steps ago have more weight than rewards from 100 steps ago
 - **Old observations decay** — entries older than `rollout_history_max_age` steps are discarded entirely
-- **The reference set grows organically** — from K×n_reps REPR medoids at the start to up to `rollout_history_max_refs` (default 2000) distinct samples by mid-training
-- **Seeded automatically** — the REPR rollouts from each selection round are always added to the buffer so the buffer is never empty
+- **The reference set grows organically** — from K×n_reps REPR medoids (round 0 only) through training batches that accumulate every step
+- **Seeded automatically** — the REPR rollouts from round 0 are always added to the buffer so the buffer is never empty
 
-**Timeline of buffer growth:**
+**Timeline of buffer growth (default v3 settings, reselect_interval=4):**
 
 | Training step | Buffer size | Source |
 |---|---|---|
-| 0 (first selection) | K×n_reps (e.g. 600) | REPR rollouts only |
-| 10 | ~1880 (600 + ~10 batches×128) | + training batches |
-| 18 (first reselect) | ~2000 (capped) | Buffer at capacity, most-recent kept |
-| 36+ | ~2000 (stable) | Oldest entries decay, replaced by fresh |
+| 0 (round 0) | K×n_reps (e.g. 600) | REPR medoid rollouts only |
+| 4 (round 1) | ~1112 (600 + 4×128) | + 4 training batches |
+| 8 (round 2) | ~1624 | + 4 more training batches |
+| 48 (pool freezes) | ~6700+ | Organic growth, no artificial cap |
+| 100+ | Stabilises | `rollout_history_max_age` prunes stale entries |
 
 **When to use it:**
-- When `n_clusters × n_reps < rollout_history_max_refs` (i.e. the REPR medoids alone don't fill the buffer)
-- When you want variance estimates to track the *current* policy's capabilities across the training distribution, not just at medoid locations
-- Most beneficial after the first 20–50 training steps when the buffer has enough diversity
+- Always recommended with the `interpolated` strategy — the buffer replaces per-round medoid re-rollouts (which are disabled by default via `reroll_medoids=false`)
+- Most beneficial after the first 10–20 training steps when the buffer has enough diversity to give good DOTS predictions without re-rolling the medoids
 
 **Recommended settings:**
 ```yaml
 use_rollout_history: true
 rollout_history_decay_rate: 0.05    # half-life ≈ 14 steps; tune up for faster adaptation
 rollout_history_max_age: 500        # discard entries >500 steps old
-rollout_history_max_refs: 2000      # cap reference set size (controls DOTS cost)
+rollout_history_max_refs: 0         # 0 = unlimited; rely on max_age pruning
 ```
 
 **Important:** `use_rollout_history` requires `strategy: interpolated` — the other strategies (scored, weighted, top_clusters) don't use per-sample DOTS interpolation and won't benefit from the buffer.
@@ -379,9 +407,44 @@ fraction of the selected pool (mean reward drifting toward 0.7+).
 
 ---
 
-### Global Budget Cap (`global_budget_pct`)
+### Annotation budget vs compute budget (v3 design)
 
-*Available on the `online-data-selection_limit-budget` branch.*
+The pipeline tracks a single quantity — `_ever_selected_set` — which is the
+union of every sample for which the trainer has consumed ground truth.  Three
+disjoint sources can add to it, and all three are debited against the same
+`global_budget_pct` cap:
+
+| Source | Tracked in | When debited |
+|---|---|---|
+| `training` | `_ever_selected_train` | Each call to `select()` |
+| `medoid` | `_ever_selected_medoid` | Each call to `update_rewards()` (REPR rollouts) |
+| `exploration` | `_ever_selected_exploration` | Each call to `update_exploration_rewards()` |
+
+Per-round budget = number of *new uniques* added per `select()` call, because
+the discovery mask (`exclude_already_selected=true`) zeros out any sample
+already in `_ever_selected_set`.  This gives the trainer a clean
+"annotation-units consumed" view that lines up exactly with what a fixed
+random baseline at the same `global_budget_pct` would see.
+
+Per-source breakdown is reported as wandb scalars
+(`data_selection/budget_breakdown/{training,medoid,exploration}` and the
+matching `_pct` variants) and visualised as a stacked area chart over
+selection rounds.
+
+### Wandb visualisations
+
+Beyond scalars, the selector logs three diagnostic images per selection round
+via `get_wandb_images()`:
+
+| Image | Shows | Notes |
+|---|---|---|
+| `data_selection/cluster_allocation` | Per-cluster sample count for the most recent round, top-40 clusters, bars coloured by current cluster variance | Always on |
+| `data_selection/selected_difficulty` | Histogram of DOTS-predicted mean reward for the most recently selected samples, with frontier line at 0.5 and dead-zone bands shaded | Only when `asymmetric_utility_enabled=true` |
+| `data_selection/selection_scatter` | 2-D PCA scatter of all embeddings (background, downsampled) overlaid with the most recently selected samples coloured by predicted mean reward (or variance) | PCA is computed once at `initialize()` and cached |
+| `data_selection/budget_breakdown` | Cumulative annotation budget by source (training / medoid / exploration) over selection rounds, with the global cap drawn as a horizontal line | Always on once `_budget_history` has any entries |
+| `data_selection/overlap_history` | Jaccard overlap between successive selection rounds, with a 0.5 reference line | Always on after round 2 |
+
+### Global Budget Cap (`global_budget_pct`)
 
 By default, the online selector picks a fresh `selection_budget_pct`% subset each round. Because the model's capabilities change, different samples are selected each round, and the **cumulative** unique data seen over training grows well beyond the per-round budget (often 30–50%+). This makes comparison with a fixed random baseline unfair — the random baseline sees exactly `selection_budget_pct`% unique samples total.
 
@@ -546,8 +609,9 @@ Pass the **full dataset** as `data.train_files` — the selector will choose the
 data_selection:
   method: cluster
   reselect_schedule: step
-  reselect_interval: 18
-  selection_budget_pct: 10.0
+  reselect_interval: 4              # one batch worth of training between discoveries
+  selection_budget_pct: 0.58        # ~128 new uniques per round on a 22k dataset
+  global_budget_pct: 10.0           # hard cap on cumulative annotated samples
 
   cluster:
     cluster_arrays_file: /path/to/cluster_arrays.npz
@@ -562,14 +626,22 @@ data_selection:
     dots_diversity: true
     dots_diversity_use_composite_score: true
     dots_diversity_temperature: 0.5
+
+    # discovery without replacement + medoid-once-only
+    exclude_already_selected: true
+    reroll_medoids: false
+
     use_rollout_history: true
     rollout_history_decay_rate: 0.05
     rollout_history_max_age: 500
-    rollout_history_max_refs: 2000
-    exploration_enabled: true
-    exploration_pct: 5.0
+    rollout_history_max_refs: 0     # unlimited; rely on age pruning
+
+    # exploration off by default — discovery mask makes it redundant
+    exploration_enabled: false
+    exploration_pct: 1.0
     exploration_pct_base: representatives
-    exploration_interval: 2
+    exploration_interval: 4
+
     asymmetric_utility_enabled: true
     hard_side_bias: 0.5
     asymmetric_dead_zone_low: 0.05
@@ -629,12 +701,21 @@ bash run_qwen3_vl-2b_online_selection.sh [ENGINE] [CLUSTER_ARRAYS] [VARIANT] [DA
 
 | Variable | Default | Description |
 |---|---|---|
+| `SELECTION_BUDGET_PCT` | `0.58` | Per-round budget as % of dataset (~128 on 22K) |
+| `RESELECT_INTERVAL` | `4` | Reselect every N training steps |
+| `GLOBAL_BUDGET_PCT` | `10.0` | Hard cap on cumulative annotated samples |
+| `EXCLUDE_ALREADY_SELECTED` | `true` | Discovery mask (selection without replacement) |
+| `REROLL_MEDOIDS` | `false` | Medoid rollouts on round 0 only |
+| `ROLLOUT_HISTORY_MAX_REFS` | `0` | Buffer size cap (0 = unlimited) |
+| `EXPLORATION_ENABLED` | `false` | Exploration rollouts (off by default) |
+| `EXPLORATION_PCT` | `1.0` | % of base to explore when enabled |
+| `EXPLORATION_INTERVAL` | `4` | Explore every N selection rounds |
+| `EXPLORATION_PCT_BASE` | `representatives` | Base for exploration % calculation |
 | `ASYMMETRIC_UTILITY` | `true` | Enable hard-side-biased utility |
 | `ASYMMETRIC_BIAS` | `0.5` | α in utility formula |
 | `ASYMMETRIC_DEAD_LOW` | `0.05` | Lower dead-zone on predicted mean reward |
 | `ASYMMETRIC_DEAD_HIGH` | `0.95` | Upper dead-zone on predicted mean reward |
 | `CUDA_VISIBLE_DEVICES` | `1,3,4,5` | GPU selection |
-| `EXPLORATION_PCT_BASE` | `representatives` | Base for exploration % calculation |
 
 ### Usage examples
 
@@ -720,6 +801,13 @@ When data selection is active, the following metrics are logged at each selectio
 | `data_selection/cumulative_coverage_pct` | Percentage of all data that has been selected at least once across all rounds. Low values = selection is stuck in a narrow region. |
 | `data_selection/cumulative_unique_selected` | Absolute count of unique samples ever selected. |
 | `data_selection/selection_round` | Current selection round number. |
+| `data_selection/budget_breakdown/training` | Cumulative unique samples added by `select()` calls. |
+| `data_selection/budget_breakdown/medoid` | Cumulative unique samples consumed by REPR medoid rollouts (round 0 only when `reroll_medoids=false`). |
+| `data_selection/budget_breakdown/exploration` | Cumulative unique samples consumed by exploration rollouts (zero when exploration is disabled). |
+| `data_selection/budget_breakdown/{training,medoid,exploration}_pct` | Same as above, normalized by `cumulative_unique_selected` (sum to 100). |
+| `data_selection/global_budget` | Absolute global budget cap (in samples) when `global_budget_pct` is set. |
+| `data_selection/global_budget_utilization_pct` | Cumulative unique samples / global cap × 100. Hits 100 at the moment the pool freezes. |
+| `data_selection/selection_frozen` | 0 / 1 indicator: 1 once the pool has frozen and frozen-reweight has taken over. |
 | `data_selection/n_clusters_ever_selected` | How many distinct clusters have had samples selected across all rounds. |
 | `data_selection/cluster_selection_freq_mean` | Mean per-cluster selection frequency (higher = more concentrated). |
 | `data_selection/cluster_selection_gini` | Gini coefficient of per-cluster selection frequency. 0=uniform, 1=all budget in one cluster. |
@@ -752,23 +840,30 @@ Automatically tracks how much the selected subset changes between rounds. Helps 
 
 ### Exploration Rollouts
 
-When `exploration_enabled=true`, the selector periodically rolls out on **random un-selected samples** to break the feedback loop where the history buffer only sees previously-selected data.
+**Disabled by default in v3.**  With `exclude_already_selected=true` the
+discovery mask already prevents the selector from re-picking previously-seen
+samples, so the original "diversify the buffer" rationale for exploration is
+largely moot.  Exploration rollouts also debit the global budget — keeping
+them on burns annotation units that would otherwise go to discovery.  Set
+`EXPLORATION_ENABLED=true` in the launch script to re-enable it for ablation.
 
-**Problem solved:** Without exploration, the DOTS reference set only contains samples that were already selected and trained on. The selector predicts variance by interpolating from this reference → selects similar samples → trains on them → adds to reference. This self-reinforcing loop means the selector never discovers that ignored regions may now be in the model's "zone of proximal development."
+When enabled, the selector periodically rolls out on **random un-selected
+samples** to break the feedback loop where the history buffer only sees
+previously-selected data.
 
 **How it works:**
 1. Every `exploration_interval` selection rounds, `get_exploration_indices()` picks `exploration_pct`% of the base from the **un-selected** pool
 2. The trainer rolls out these samples using the same rollout infrastructure as REPR rollouts
-3. Results are fed into the history buffer via `update_exploration_rewards()`
+3. Results are fed into the history buffer via `update_exploration_rewards()`, which also debits these samples against `_ever_selected_set` (so they count toward the global budget cap, just like medoid and training rollouts)
 4. Next DOTS interpolation now has visibility into previously-ignored regions
 
 **Config:**
 ```yaml
 data_selection.cluster:
-  exploration_enabled: true
-  exploration_pct: 5.0                 # 5% of reference set size (~30 samples)
+  exploration_enabled: false           # off by default
+  exploration_pct: 1.0                 # 1% of reference set size (~6 samples)
   exploration_pct_base: representatives  # or "dataset" for % of full dataset
-  exploration_interval: 2              # explore every other selection round
+  exploration_interval: 4              # explore every 4 selection rounds
 ```
 
 ---
@@ -804,58 +899,6 @@ data_selection.cluster:
   igs_enabled: false            # Enable IGS in composite scoring
   igs_weight: 1.0               # Exponent on IGS in composite score (higher = stronger preference for multimodal)
 ```
-
----
-
-### Global Budget Cap (`global_budget_pct`)
-
-By default, the online selector picks a fresh `selection_budget_pct`% subset each round. Because the model's capabilities change, different samples are selected each round, and the **cumulative** unique data seen over training grows well beyond the per-round budget (often 30–50%+). This makes comparison with a fixed random baseline unfair — the random baseline sees exactly `selection_budget_pct`% unique samples total.
-
-Setting `global_budget_pct` caps the cumulative unique sample count. Once the union of all ever-selected samples reaches the cap, the **pool composition freezes** (no new samples). But periodic reselection rounds continue — they just skip reference/exploration rollouts and instead **reweight within the frozen pool** using training-batch reward variance.
-
-**Typical usage — fair comparison with random 10%:**
-```bash
-data_selection.selection_budget_pct=10.0 \
-data_selection.global_budget_pct=10.0
-```
-
-With `global_budget_pct == selection_budget_pct`, the first selection round uses initial-policy rollouts + DOTS interpolation to pick the smartest 10% of the dataset, then freezes the pool. The model trains on exactly 10% unique samples — identical data volume to the random baseline — but the *which* 10% is variance-informed rather than random.
-
-**Adaptive reweighting within the frozen pool:**
-
-After the pool freezes, subsequent reselection rounds are lightweight (no rollouts):
-
-1. Training-batch reward variances continue accumulating in `_rollout_buffer` (requires `use_rollout_history=True`)
-2. Every `reselect_interval` steps, `select()` computes time-weighted per-sample variance from the buffer
-3. Samples with high variance (still in the learning zone) are sampled more frequently
-4. Samples with zero variance (mastered or too hard) are sampled less frequently (but with a 5% floor weight to prevent starvation)
-5. The dataloader is rebuilt with variance-weighted sampling (with replacement)
-
-This means: even though the set of unique samples is fixed, the model spends more compute on informative samples — effectively a curriculum within the frozen pool.
-
-**Compute savings:** Reference rollouts (~500 samples × 17 rounds ≈ 8,500 inference passes) and exploration rollouts are eliminated. Only the cheap reweight computation runs.
-
-**Config:**
-```yaml
-data_selection:
-  selection_budget_pct: 10.0
-  global_budget_pct: 10.0        # freeze pool after first round
-  cluster:
-    use_rollout_history: true    # required for adaptive reweighting
-```
-
-**Console output:**
-```
-[ClusterSelector] Global budget cap reached: 2268 unique NPZ samples >= 2268 (10.0% of 22675). Pool frozen — subsequent rounds will reweight within this pool using training reward variance.
-[ClusterSelector] Frozen reweight round 2: 1847 unique/2268 total, max_reps=4, var=[0.0000, 0.2500], zero_var=312/2268
-```
-
-**WandB metrics (frozen pool):**
-- `data_selection/frozen_pool_var_mean` — mean per-sample variance in the pool (should decrease as model learns)
-- `data_selection/frozen_pool_n_zero_var` — samples with zero variance (mastered/too-hard; downweighted in sampling)
-- `data_selection/frozen_pool_n_with_data` — samples with at least one training observation in the buffer
-
-If `use_rollout_history=False`, the reweight falls back to uniform sampling (all pool samples equally likely).
 
 ---
 
