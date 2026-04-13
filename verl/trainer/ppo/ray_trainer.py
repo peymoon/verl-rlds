@@ -1185,6 +1185,12 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # save data selector state (frozen pool, rollout buffer, budget tracking)
+        if self.data_selector is not None and hasattr(self.data_selector, "get_state_dict"):
+            selector_local_path = os.path.join(local_global_step_folder, "data_selector.pt")
+            torch.save(self.data_selector.get_state_dict(), selector_local_path)
+            print(f"Saved data selector state to {selector_local_path}")
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1257,6 +1263,16 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        # load data selector state (frozen pool, rollout buffer, budget tracking)
+        if self.data_selector is not None and hasattr(self.data_selector, "load_state_dict"):
+            selector_local_path = os.path.join(global_step_folder, "data_selector.pt")
+            if os.path.exists(selector_local_path):
+                selector_state = torch.load(selector_local_path, weights_only=False)
+                self.data_selector.load_state_dict(selector_state)
+            else:
+                print(f"Warning: No data selector state found at {selector_local_path}, "
+                      "selector will restart from scratch (frozen pool and rollout buffer lost)")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""

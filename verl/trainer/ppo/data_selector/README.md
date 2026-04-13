@@ -570,8 +570,44 @@ If `use_rollout_history=False`, the reweight falls back to uniform sampling (all
 |---|---|---|
 | `medoid` ★ | Pick `n_reps` samples with highest mean cosine similarity to all cluster members | O(n²) per cluster at init |
 | `centroid_nearest` | Pick `n_reps` samples closest in L2 to centroid | O(n) per cluster at init |
+| `density_diverse` | Density-aware diverse selection with greedy suppression (see below) | k-NN + greedy loop per cluster |
 
 ★ current script uses `medoid`
+
+##### `density_diverse` — density-aware diverse representative selection
+
+Ported from the offline pipeline (`cluster_selection/02_select_representatives.py` on the `benchmark_repr` branch). Combines local density with centroid proximity and enforces spatial diversity across representatives.
+
+**Algorithm:**
+1. **k-NN density estimation** — for each point in the cluster, compute density as `1 / (mean cosine distance to k nearest neighbors)`. Points in dense regions score higher.
+2. **Composite scoring** — `score_i = density_norm^alpha * centroid_sim^beta`, where `density_norm` is min-max normalised density and `centroid_sim` is the cosine similarity to the cluster centroid (clipped to [0, 1]).
+3. **Greedy diverse selection** — pick the highest-scoring point as representative, then suppress (mask out) all points within `diversity_radius` cosine distance of the pick. Repeat until `n_reps` representatives are selected.
+
+**Why it's useful for online selection:**
+- **Handles `n_reps > 1` natively** — unlike `medoid` (which uses remove-and-rerun), the suppression radius ensures representatives are spread across different sub-regions of each cluster. This gives better coverage of the cluster's internal structure.
+- **Avoids outlier-adjacent probes** — the density term penalises isolated points that might be noise or boundary samples, producing more reliable variance estimates.
+- **Downstream benefit** — better-spread representatives → better DOTS interpolation in the `interpolated` strategy, because the reference set covers more of the embedding space.
+
+**Hyperparameters** (set via Hydra overrides or env vars):
+
+| Parameter | Default | Description |
+|---|---|---|
+| `density_diverse_k` | 10 | k for k-NN density estimation. Larger k → smoother density; smaller k → more local |
+| `density_diverse_alpha` | 1.0 | Exponent on the normalised density term. Higher → favour denser regions more |
+| `density_diverse_beta` | 1.0 | Exponent on centroid proximity. Higher → favour central samples more |
+| `density_diverse_radius` | 0.15 | Cosine-distance suppression radius. After picking a rep, suppress all points with cosine similarity > (1 - radius). Set to 0 to disable diversity enforcement |
+
+**Usage example:**
+```bash
+REPRESENTATIVE_METHOD=density_diverse bash run_qwen3_vl-2b_online_selection.sh
+
+# With custom hyperparameters:
+REPRESENTATIVE_METHOD=density_diverse bash run_qwen3_vl-2b_online_selection.sh \
+    vllm /path/cluster_arrays.npz interpolated_weighted /path/dataset.json \
+    data_selection.cluster.density_diverse_k=15 \
+    data_selection.cluster.density_diverse_alpha=1.5 \
+    data_selection.cluster.density_diverse_radius=0.2
+```
 
 The representatives are fixed after `initialize()` — they don't change during training. Their rollout rewards change because the policy changes.
 
@@ -974,3 +1010,154 @@ class MySelector(DataSelector):
     def select(self, budget):
         return list(range(budget))  # return dataset indices
 ```
+
+---
+
+## Variance Predictor Framework
+
+### Motivation
+
+The original DOTS interpolation is a fixed-bandwidth cosine-KNN regressor
+(Nadaraya-Watson with softmax temperature). It has three fundamental
+limitations:
+
+1. **Pre-aggregation destroys provenance.** `_compute_time_weighted_variances`
+   collapses per-sample observations into a single scalar *before* the
+   predictor sees them, discarding per-observation step and n_rollouts info.
+2. **Time decay in labels, not fit.** The decay factor `exp(-lambda * dt)`
+   weights labels, but the predictor itself has no concept of staleness.
+3. **No learned parameters, no uncertainty.** The same fixed medoids are probed
+   every round regardless of where the predictor is weakest.
+
+The `VariancePredictor` framework (`variance_predictor.py`) replaces the inline
+DOTS calls with a pluggable predictor that receives raw observation rows and
+decides internally how to weight, fit, and predict.
+
+### Architecture
+
+```
+_rollout_buffer
+    │
+    ▼
+_build_observation_rows()          ← raw (npz_idx, step, rewards_array) rows
+    │
+    ▼
+predictor.fit(obs, emb, step)      ← time-decay in fit weights, not labels
+    │
+    ▼
+predictor.predict(emb)             ← PredictionResult(predicted_var, predicted_mean, uncertainty)
+    │
+    ▼
+_select_interpolated / _select_frozen_reweight   ← unchanged allocation logic
+```
+
+### Predictor Types
+
+| Type | `predictor_type` | Description |
+|------|-----------------|-------------|
+| **KNN** | `knn` (default) | Legacy cosine-KNN / Nadaraya-Watson. Zero behavior change from the original code. |
+| **Ridge** | `ridge` | Weighted Ridge regression with joint p-hat head. Predicts mean reward `p_hat`, derives variance as `p_hat * (1 - p_hat)`. Provides posterior uncertainty for active probing. Closed-form solution, millisecond refit. |
+| **MLP** | `mlp` | 2-layer MLP (`d -> hidden -> 1`) predicting mean reward logit. Warm-started across rounds (parameters and optimizer state persist). 5-20 AdamW steps per `fit()` call. |
+
+### Joint p-hat Head (Ridge and MLP)
+
+For binary GRPO rewards, `Var = p(1-p)` exactly. Instead of predicting variance
+directly (a noisy estimator from 8 rollouts), the Ridge and MLP predictors
+predict mean reward `p_hat` and derive variance analytically. This:
+
+- Gives 8x more training signal (one observation per rollout instead of one
+  aggregate variance per sample per step).
+- Eliminates the need for a separate DOTS call for mean reward (asymmetric
+  utility becomes a direct function of `p_hat`).
+- Is exact for binary rewards and a good approximation for continuous rewards
+  (IOU tasks), where variance normalization already handles scale.
+
+### Active Probe Selection (Ridge only)
+
+When `predictor_active_probes=true` and `predictor_type=ridge`, the fixed
+medoid probe set is replaced with UCB-based acquisition:
+
+```
+acq(x) = utility(x) + beta * sigma(x)
+```
+
+where `sigma(x)` is the Ridge posterior standard deviation. Points are selected
+greedily with diversity suppression (nearby points within cosine distance
+`predictor_active_probe_suppress_radius` are masked after each pick). This
+closes the loop: the regressor decides where to probe, those rollouts shrink
+uncertainty where it matters, and the next round's selection is sharper.
+
+### Validation Metrics
+
+Every selection round logs predictor diagnostics to wandb:
+
+| Metric | Description |
+|--------|-------------|
+| `data_selection/predictor_train_r2` | R² of predicted vs observed variance at reference points (training error) |
+| `data_selection/predictor_train_mae` | Mean absolute error at reference points |
+| `data_selection/predictor_train_spearman` | Spearman rank correlation at reference points |
+| `data_selection/loo_knn_r2` | **Leave-One-Out KNN R²** — the embedding ceiling. If < 0.15, no regressor can help. |
+| `data_selection/loo_knn_mae` | LOO-KNN mean absolute error |
+| `data_selection/loo_knn_spearman` | LOO-KNN Spearman rank correlation |
+| `data_selection/n_reference_points` | Number of reference points used |
+| `data_selection/predictor_type` | 0=knn, 1=ridge, 2=mlp |
+
+A **predicted vs observed scatter plot** (`data_selection/pred_vs_obs_scatter`)
+is generated as a wandb image at each selection round.
+
+### Configuration
+
+All config lives in `ClusterSelectorConfig` (passed via Hydra):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `predictor_type` | `knn` | `"knn"`, `"ridge"`, or `"mlp"` |
+| `predictor_alpha` | `1.0` | Ridge regularization strength |
+| `predictor_mlp_hidden` | `256` | MLP hidden dimension |
+| `predictor_mlp_lr` | `1e-3` | MLP learning rate |
+| `predictor_mlp_steps` | `10` | Gradient steps per `fit()` call |
+| `predictor_mlp_weight_decay` | `1e-3` | MLP weight decay |
+| `predictor_active_probes` | `false` | Enable UCB-based active probe selection |
+| `predictor_ucb_beta` | `1.0` | UCB exploration coefficient |
+| `predictor_active_probe_suppress_radius` | `0.1` | Cosine-distance diversity suppression |
+
+### Shell Script Usage
+
+```bash
+# Default: KNN baseline (zero behavior change)
+PREDICTOR_TYPE=knn bash run_qwen3_vl-2b_online_selection.sh
+
+# Ridge predictor with joint p-hat head
+PREDICTOR_TYPE=ridge bash run_qwen3_vl-2b_online_selection.sh
+
+# Ridge with stronger regularization
+PREDICTOR_TYPE=ridge PREDICTOR_ALPHA=10.0 bash run_qwen3_vl-2b_online_selection.sh
+
+# MLP predictor (warm-started across rounds)
+PREDICTOR_TYPE=mlp bash run_qwen3_vl-2b_online_selection.sh
+
+# MLP with custom hyperparameters
+PREDICTOR_TYPE=mlp PREDICTOR_MLP_HIDDEN=512 PREDICTOR_MLP_STEPS=20 \
+    bash run_qwen3_vl-2b_online_selection.sh
+
+# Ridge + active probes (uncertainty-driven probe selection)
+PREDICTOR_TYPE=ridge ACTIVE_PROBES=true bash run_qwen3_vl-2b_online_selection.sh
+
+# Ridge + active probes with higher exploration
+PREDICTOR_TYPE=ridge ACTIVE_PROBES=true ACTIVE_PROBES_UCB_BETA=2.0 \
+    bash run_qwen3_vl-2b_online_selection.sh
+```
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `variance_predictor.py` | `VariancePredictor` ABC, `PredictionResult`, `KNNPredictor`, `RidgePredictor`, `MLPPredictor`, `build_predictor()`, diagnostic utilities |
+| `cluster_selector.py` | Integration: `_build_observation_rows()`, predictor wiring in `_select_interpolated` / `_select_frozen_reweight` / `get_reference_indices` / state dict |
+
+### Checkpoint Compatibility
+
+Predictor state is saved in `data_selector.pt` alongside existing selector
+state. Old checkpoints without predictor state load cleanly (the predictor
+starts from scratch). MLP optimizer and model weights are persisted for
+warm-start across resume boundaries.

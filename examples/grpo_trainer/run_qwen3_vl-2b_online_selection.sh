@@ -98,7 +98,7 @@ Usage:
 Positional args:
     ENGINE          vllm | sglang (default: vllm)
     CLUSTER_ARRAYS  path to cluster_arrays.npz
-                                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz)
+                                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz)
     VARIANT         interpolated_weighted | interpolated (default: interpolated_weighted)
     DATASET_JSON    JSON/JSONL used to build cluster embeddings (required for NPZ↔parquet remap)
                                     (default: /workspace/rl_data_selection/data/VLAA-Thinking/VLAA-Thinking-GRPO-25K_train_90_100.json)
@@ -111,7 +111,7 @@ Important selector method options (from cluster_selector.py):
         centroid_nearest | mmd
 
     data_selection.cluster.representative_method:
-        medoid | centroid_nearest
+        medoid | centroid_nearest | density_diverse
 
 Variant behavior:
     interpolated_weighted -> strategy=interpolated, dots_diversity=true,
@@ -121,12 +121,23 @@ Variant behavior:
                                                      dots_diversity_use_composite_score=false,
                                                      use_rollout_history=false
 
+    density_diverse hyperparameters (when representative_method=density_diverse):
+        data_selection.cluster.density_diverse_k          (default: 10)
+        data_selection.cluster.density_diverse_alpha       (default: 1.0)
+        data_selection.cluster.density_diverse_beta        (default: 1.0)
+        data_selection.cluster.density_diverse_radius      (default: 0.15)
+
 Common env vars:
     GLOBAL_BUDGET_PCT, SELECTION_BUDGET_PCT, RESELECT_INTERVAL,
-    EXCLUDE_ALREADY_SELECTED, REROLL_MEDOIDS,
+    EXCLUDE_ALREADY_SELECTED, REROLL_MEDOIDS, REPRESENTATIVE_METHOD,
+    DENSITY_DIVERSE_K, DENSITY_DIVERSE_ALPHA, DENSITY_DIVERSE_BETA, DENSITY_DIVERSE_RADIUS,
     EXPLORATION_ENABLED, EXPLORATION_PCT, EXPLORATION_INTERVAL, EXPLORATION_PCT_BASE,
     ASYMMETRIC_UTILITY, ASYMMETRIC_BIAS, ASYMMETRIC_DEAD_LOW, ASYMMETRIC_DEAD_HIGH,
-    ROLLOUT_HISTORY_MAX_REFS, CUDA_VISIBLE_DEVICES
+    ROLLOUT_HISTORY_MAX_REFS, NORMALIZE_VARIANCE, COUNT_MEDOIDS_IN_BUDGET,
+    BUDGET_SCHEDULE, CUDA_VISIBLE_DEVICES,
+    PREDICTOR_TYPE, PREDICTOR_ALPHA,
+    PREDICTOR_MLP_HIDDEN, PREDICTOR_MLP_LR, PREDICTOR_MLP_STEPS, PREDICTOR_MLP_WEIGHT_DECAY,
+    ACTIVE_PROBES, ACTIVE_PROBES_UCB_BETA, ACTIVE_PROBES_SUPPRESS_RADIUS
 
 Examples:
     bash run_qwen3_vl-2b_online_selection.sh
@@ -144,7 +155,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 fi
 
 ENGINE=${1:-vllm}
-CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz}
+CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz}
 VARIANT=${3:-interpolated_weighted}
 # Path to the JSON/JSONL that was used to build the cluster embeddings.
 # Required to correctly align NPZ row order with parquet row order — these
@@ -239,14 +250,84 @@ EXPLORATION_ENABLED=${EXPLORATION_ENABLED:-false}
 EXPLORATION_PCT=${EXPLORATION_PCT:-1.0}
 EXPLORATION_INTERVAL=${EXPLORATION_INTERVAL:-4}
 
+# --- Representative selection method ---
+# How to pick the fixed probe set (medoids) from each cluster.
+#   medoid            — highest mean cosine similarity to all cluster members (default)
+#   centroid_nearest  — closest L2 to centroid
+#   density_diverse   — density × centroid-proximity with diversity suppression
+REPRESENTATIVE_METHOD=${REPRESENTATIVE_METHOD:-density_diverse}
+
+# density_diverse knobs (used when REPRESENTATIVE_METHOD=density_diverse)
+DENSITY_DIVERSE_K=${DENSITY_DIVERSE_K:-10}
+DENSITY_DIVERSE_ALPHA=${DENSITY_DIVERSE_ALPHA:-1.0}
+DENSITY_DIVERSE_BETA=${DENSITY_DIVERSE_BETA:-1.0}
+DENSITY_DIVERSE_RADIUS=${DENSITY_DIVERSE_RADIUS:-0.15}
+
 # Buffer cap: 0 = unlimited (rely on rollout_history_max_age pruning).  Older
 # values like 2000 throw away recent observations the trainer already paid for.
 ROLLOUT_HISTORY_MAX_REFS=${ROLLOUT_HISTORY_MAX_REFS:-0}
 
-EXP_NAME="v3_k50_r10_perRound${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
+# --- Variance normalization ---
+# Normalize per-sample variance by mean*(1-mean) so binary-reward tasks
+# (math/mcq/digit) and continuous-reward tasks (IoU grounding) are scored
+# on a comparable [0,1] scale.
+NORMALIZE_VARIANCE=${NORMALIZE_VARIANCE:-true}
+
+# --- Medoid budget accounting ---
+# When false, medoid probe rollouts do NOT count against global_budget_pct.
+COUNT_MEDOIDS_IN_BUDGET=${COUNT_MEDOIDS_IN_BUDGET:-false}
+
+# --- Budget schedule (phased discovery) ---
+# Hydra/OmegaConf list of phases, or "none" to use flat
+# SELECTION_BUDGET_PCT / RESELECT_INTERVAL.
+#
+# Example Hydra form:
+#   [{until_budget_pct:50,per_round_pct:1.0,interval:4}, ...]
+#
+# JSON-like input is also accepted via env var and normalized automatically:
+#   [{"until_budget_pct":50,"per_round_pct":1.0,"interval":4}, ...]
+#
+# Default: aggressive early discovery tapering to slow late discovery.
+BUDGET_SCHEDULE=${BUDGET_SCHEDULE:-'[{until_budget_pct:50,per_round_pct:1.0,interval:4},{until_budget_pct:85,per_round_pct:0.3,interval:10},{until_budget_pct:100,per_round_pct:0.15,interval:16}]'}
+
+# Convert BUDGET_SCHEDULE to hydra override (or empty if "none").
+# Normalize JSON-like quoted keys into OmegaConf/Hydra key syntax, and strip
+# whitespace to avoid shell arg splitting.
+if [ "$BUDGET_SCHEDULE" = "none" ] || [ -z "$BUDGET_SCHEDULE" ]; then
+    BUDGET_SCHEDULE_OVERRIDE=""
+else
+    BUDGET_SCHEDULE_NORMALIZED=$(printf '%s' "$BUDGET_SCHEDULE" | sed -E 's/"([A-Za-z_][A-Za-z0-9_]*)"[[:space:]]*:/\1:/g' | tr -d '[:space:]')
+    BUDGET_SCHEDULE_OVERRIDE="+data_selection.cluster.budget_schedule=${BUDGET_SCHEDULE_NORMALIZED}"
+fi
+
+# --- Variance predictor ---
+# Controls which predictor backs the DOTS interpolation.
+#   knn   — legacy cosine-KNN / Nadaraya-Watson (default, zero behavior change)
+#   ridge — weighted Ridge regression with joint p-hat head + uncertainty
+#   mlp   — 2-layer MLP warm-started across selection rounds
+PREDICTOR_TYPE=${PREDICTOR_TYPE:-knn}
+PREDICTOR_ALPHA=${PREDICTOR_ALPHA:-1.0}
+PREDICTOR_MLP_HIDDEN=${PREDICTOR_MLP_HIDDEN:-256}
+PREDICTOR_MLP_LR=${PREDICTOR_MLP_LR:-1e-3}
+PREDICTOR_MLP_STEPS=${PREDICTOR_MLP_STEPS:-10}
+PREDICTOR_MLP_WEIGHT_DECAY=${PREDICTOR_MLP_WEIGHT_DECAY:-1e-3}
+
+# Active probe selection (requires predictor with uncertainty, e.g. "ridge")
+ACTIVE_PROBES=${ACTIVE_PROBES:-false}
+ACTIVE_PROBES_UCB_BETA=${ACTIVE_PROBES_UCB_BETA:-1.0}
+ACTIVE_PROBES_SUPPRESS_RADIUS=${ACTIVE_PROBES_SUPPRESS_RADIUS:-0.1}
+
+if [ "$PREDICTOR_TYPE" != "knn" ]; then
+    EXP_SUFFIX="${EXP_SUFFIX}_pred${PREDICTOR_TYPE}"
+fi
+if [ "$ACTIVE_PROBES" = "true" ]; then
+    EXP_SUFFIX="${EXP_SUFFIX}_activeProbes"
+fi
+
+EXP_NAME="v6_k300_r2_${REPRESENTATIVE_METHOD}_${PREDICTOR_TYPE}_${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,3,4,5"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"3,4,5,7"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet \
@@ -264,11 +345,15 @@ python3 -m verl.trainer.main_ppo \
     data_selection.global_budget_pct=$GLOBAL_BUDGET_PCT \
     data_selection.cluster.cluster_arrays_file=$CLUSTER_ARRAYS \
     data_selection.cluster.dataset_json_file=$DATASET_JSON \
-    data_selection.cluster.n_clusters=50 \
-    data_selection.cluster.n_reps=10 \
+    data_selection.cluster.n_clusters=300 \
+    data_selection.cluster.n_reps=2 \
     data_selection.cluster.strategy=interpolated \
     data_selection.cluster.within_cluster_method=centroid_nearest \
-    data_selection.cluster.representative_method=medoid \
+    data_selection.cluster.representative_method=$REPRESENTATIVE_METHOD \
+    +data_selection.cluster.density_diverse_k=$DENSITY_DIVERSE_K \
+    +data_selection.cluster.density_diverse_alpha=$DENSITY_DIVERSE_ALPHA \
+    +data_selection.cluster.density_diverse_beta=$DENSITY_DIVERSE_BETA \
+    +data_selection.cluster.density_diverse_radius=$DENSITY_DIVERSE_RADIUS \
     data_selection.cluster.dots_temperature=0.05 \
     data_selection.cluster.dots_diversity_temperature=0.5 \
     data_selection.cluster.dots_top_k=64 \
@@ -290,6 +375,18 @@ python3 -m verl.trainer.main_ppo \
     data_selection.cluster.hard_side_bias=$ASYMMETRIC_BIAS \
     data_selection.cluster.asymmetric_dead_zone_low=$ASYMMETRIC_DEAD_LOW \
     data_selection.cluster.asymmetric_dead_zone_high=$ASYMMETRIC_DEAD_HIGH \
+    +data_selection.cluster.normalize_variance=$NORMALIZE_VARIANCE \
+    +data_selection.cluster.count_medoids_in_budget=$COUNT_MEDOIDS_IN_BUDGET \
+    +data_selection.cluster.predictor_type=$PREDICTOR_TYPE \
+    +data_selection.cluster.predictor_alpha=$PREDICTOR_ALPHA \
+    +data_selection.cluster.predictor_mlp_hidden=$PREDICTOR_MLP_HIDDEN \
+    +data_selection.cluster.predictor_mlp_lr=$PREDICTOR_MLP_LR \
+    +data_selection.cluster.predictor_mlp_steps=$PREDICTOR_MLP_STEPS \
+    +data_selection.cluster.predictor_mlp_weight_decay=$PREDICTOR_MLP_WEIGHT_DECAY \
+    +data_selection.cluster.predictor_active_probes=$ACTIVE_PROBES \
+    +data_selection.cluster.predictor_ucb_beta=$ACTIVE_PROBES_UCB_BETA \
+    +data_selection.cluster.predictor_active_probe_suppress_radius=$ACTIVE_PROBES_SUPPRESS_RADIUS \
+    ${BUDGET_SCHEDULE_OVERRIDE:-} \
     actor_rollout_ref.model.path=Qwen/Qwen3-VL-2B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
