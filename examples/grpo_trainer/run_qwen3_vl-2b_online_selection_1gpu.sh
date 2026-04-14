@@ -98,7 +98,7 @@ Usage:
 Positional args:
     ENGINE          vllm | sglang (default: vllm)
     CLUSTER_ARRAYS  path to cluster_arrays.npz
-                                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_50_cluster_new/cluster_arrays.npz)
+                                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz)
     VARIANT         interpolated_weighted | interpolated (default: interpolated_weighted)
     DATASET_JSON    JSON/JSONL used to build cluster embeddings (required for NPZ↔parquet remap)
                                     (default: /workspace/rl_data_selection/data/VLAA-Thinking/VLAA-Thinking-GRPO-25K_train_90_100.json)
@@ -134,10 +134,7 @@ Common env vars:
     EXPLORATION_ENABLED, EXPLORATION_PCT, EXPLORATION_INTERVAL, EXPLORATION_PCT_BASE,
     ASYMMETRIC_UTILITY, ASYMMETRIC_BIAS, ASYMMETRIC_DEAD_LOW, ASYMMETRIC_DEAD_HIGH,
     ROLLOUT_HISTORY_MAX_REFS, NORMALIZE_VARIANCE, COUNT_MEDOIDS_IN_BUDGET,
-    BUDGET_SCHEDULE, CUDA_VISIBLE_DEVICES,
-    PREDICTOR_TYPE, PREDICTOR_ALPHA,
-    PREDICTOR_MLP_HIDDEN, PREDICTOR_MLP_LR, PREDICTOR_MLP_STEPS, PREDICTOR_MLP_WEIGHT_DECAY,
-    ACTIVE_PROBES, ACTIVE_PROBES_UCB_BETA, ACTIVE_PROBES_SUPPRESS_RADIUS
+    BUDGET_SCHEDULE, CUDA_VISIBLE_DEVICES
 
 Examples:
     bash run_qwen3_vl-2b_online_selection.sh
@@ -300,34 +297,10 @@ else
     BUDGET_SCHEDULE_OVERRIDE="+data_selection.cluster.budget_schedule=${BUDGET_SCHEDULE_NORMALIZED}"
 fi
 
-# --- Variance predictor ---
-# Controls which predictor backs the DOTS interpolation.
-#   knn   — legacy cosine-KNN / Nadaraya-Watson (default, zero behavior change)
-#   ridge — weighted Ridge regression with joint p-hat head + uncertainty
-#   mlp   — 2-layer MLP warm-started across selection rounds
-PREDICTOR_TYPE=${PREDICTOR_TYPE:-knn}
-PREDICTOR_ALPHA=${PREDICTOR_ALPHA:-1.0}
-PREDICTOR_MLP_HIDDEN=${PREDICTOR_MLP_HIDDEN:-256}
-PREDICTOR_MLP_LR=${PREDICTOR_MLP_LR:-1e-3}
-PREDICTOR_MLP_STEPS=${PREDICTOR_MLP_STEPS:-10}
-PREDICTOR_MLP_WEIGHT_DECAY=${PREDICTOR_MLP_WEIGHT_DECAY:-1e-3}
-
-# Active probe selection (requires predictor with uncertainty, e.g. "ridge")
-ACTIVE_PROBES=${ACTIVE_PROBES:-false}
-ACTIVE_PROBES_UCB_BETA=${ACTIVE_PROBES_UCB_BETA:-1.0}
-ACTIVE_PROBES_SUPPRESS_RADIUS=${ACTIVE_PROBES_SUPPRESS_RADIUS:-0.1}
-
-if [ "$PREDICTOR_TYPE" != "knn" ]; then
-    EXP_SUFFIX="${EXP_SUFFIX}_pred${PREDICTOR_TYPE}"
-fi
-if [ "$ACTIVE_PROBES" = "true" ]; then
-    EXP_SUFFIX="${EXP_SUFFIX}_activeProbes"
-fi
-
-EXP_NAME="v62_k300_r2_${REPRESENTATIVE_METHOD}_${PREDICTOR_TYPE}_${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
+EXP_NAME="v666_k300_r2_${REPRESENTATIVE_METHOD}perRound${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"2,4,5,7"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"7"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet \
@@ -377,15 +350,6 @@ python3 -m verl.trainer.main_ppo \
     data_selection.cluster.asymmetric_dead_zone_high=$ASYMMETRIC_DEAD_HIGH \
     +data_selection.cluster.normalize_variance=$NORMALIZE_VARIANCE \
     +data_selection.cluster.count_medoids_in_budget=$COUNT_MEDOIDS_IN_BUDGET \
-    +data_selection.cluster.predictor_type=$PREDICTOR_TYPE \
-    +data_selection.cluster.predictor_alpha=$PREDICTOR_ALPHA \
-    +data_selection.cluster.predictor_mlp_hidden=$PREDICTOR_MLP_HIDDEN \
-    +data_selection.cluster.predictor_mlp_lr=$PREDICTOR_MLP_LR \
-    +data_selection.cluster.predictor_mlp_steps=$PREDICTOR_MLP_STEPS \
-    +data_selection.cluster.predictor_mlp_weight_decay=$PREDICTOR_MLP_WEIGHT_DECAY \
-    +data_selection.cluster.predictor_active_probes=$ACTIVE_PROBES \
-    +data_selection.cluster.predictor_ucb_beta=$ACTIVE_PROBES_UCB_BETA \
-    +data_selection.cluster.predictor_active_probe_suppress_radius=$ACTIVE_PROBES_SUPPRESS_RADIUS \
     ${BUDGET_SCHEDULE_OVERRIDE:-} \
     actor_rollout_ref.model.path=Qwen/Qwen3-VL-2B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -401,7 +365,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.max_model_len=16384 \
@@ -416,13 +380,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_vlaa_grpo_full' \
     trainer.experiment_name="${EXP_NAME}" \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=3 \
     trainer.total_epochs=170 \
     trainer.default_local_dir=/workspace/rl_data_selection/peyman/outputs/checkpoints/online_selection/${EXP_NAME} \
-    actor_rollout_ref.rollout.agent.num_workers=4 \
+    actor_rollout_ref.rollout.agent.num_workers=1 \
     trainer.rollout_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME} \
     trainer.val_before_train=False \
     trainer.validation_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME}_val "$@"

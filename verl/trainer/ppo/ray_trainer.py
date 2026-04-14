@@ -417,6 +417,15 @@ class RayPPOTrainer:
         from verl.trainer.ppo.data_selector import build_selector
         self.data_selector = build_selector(ds_config)
         self.data_selector.initialize(self.train_dataset, self.collate_fn)
+        # Ensure the selector always returns enough samples for at least one
+        # full training batch.  Without this floor, a tapering budget schedule
+        # (e.g. phase 2 with per_round_pct=0.3%) can drop the per-round
+        # selection below train_batch_size, and the rebuilt dataloader
+        # (drop_last=True) would then have 0 batches and stall training.
+        train_batch_size = int(self.config.data.get(
+            "gen_batch_size", self.config.data.train_batch_size
+        ))
+        self.data_selector.set_min_training_pool_size(train_batch_size)
         self._data_selection_active = True
         self._data_selection_schedule = ds_config.get("reselect_schedule", "epoch")
         self._data_selection_initial_pending = self._data_selection_schedule == "step"

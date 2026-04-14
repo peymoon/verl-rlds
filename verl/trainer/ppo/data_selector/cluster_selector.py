@@ -1045,7 +1045,11 @@ class ClusterSelector(DataSelector):
         cluster_rewards = defaultdict(list)
         cluster_all_rewards = defaultdict(list)
 
-        idx_to_cluster = dict(zip(self._rep_indices, self._rep_cluster_ids))
+        # Look up cluster membership from the full per-sample assignments
+        # array, not a rep-only dict.  Active probes (and any other non-medoid
+        # ref selection) must also contribute to cluster variance — otherwise
+        # _cluster_variances stays empty and select() short-circuits to random.
+        n_cluster_ids = len(self._cluster_ids) if self._cluster_ids is not None else 0
 
         # ref_indices are parquet positions (from get_reference_indices which
         # already remapped via _npz_to_dataset). Convert back to NPZ positions
@@ -1062,9 +1066,9 @@ class ClusterSelector(DataSelector):
             global_idx = to_npz(parquet_ref_idx)  # NPZ position
             if global_idx < 0:
                 continue  # parquet row has no NPZ counterpart (filtered sample)
-            c_id = idx_to_cluster.get(global_idx)
-            if c_id is None:
+            if n_cluster_ids == 0 or global_idx >= n_cluster_ids:
                 continue
+            c_id = int(self._cluster_ids[global_idx])
             mean_r = float(ref_rewards[i].mean())
             var_r = float(ref_rewards[i].var())
             # Normalize variance by mean*(1-mean) so binary and continuous
@@ -1599,13 +1603,23 @@ class ClusterSelector(DataSelector):
         if self._selection_frozen:
             return self._select_frozen_reweight(budget)
 
-        if not self._cluster_variances:
+        strategy = self.cluster_config.strategy
+
+        # Cold-start fallback: only resort to random when neither the
+        # cluster-level signal NOR the sample-level rollout buffer has any
+        # data yet.  The `interpolated` strategy reads from the rollout
+        # buffer via _fit_predict_cached, so an empty _cluster_variances
+        # alone is NOT a reason to go random — that used to silently
+        # degrade runs where active probes populated the buffer but not
+        # the rep-keyed variance dict.
+        has_cluster_signal = bool(self._cluster_variances)
+        has_sample_signal = bool(self._rollout_buffer) or bool(self._rep_variances)
+        if not has_cluster_signal and not (strategy == "interpolated" and has_sample_signal):
             print("[ClusterSelector] No variance data yet, selecting random")
             return self._rng.choice(
                 self._dataset_size, size=min(budget, self._dataset_size), replace=False
             ).tolist()
 
-        strategy = self.cluster_config.strategy
         if strategy == "top_clusters":
             npz_indices = self._select_top_clusters(budget)
         elif strategy == "weighted":
@@ -1673,6 +1687,59 @@ class ClusterSelector(DataSelector):
                       f"medoids_in_budget={self.cluster_config.count_medoids_in_budget}). "
                       f"Pool frozen — subsequent rounds will reweight within "
                       f"this pool using training reward variance.")
+
+        # --- Pad to minimum training-pool size ---
+        # The per-round discovery budget only counts NEW unique samples the
+        # selector wants rolled out; the dataloader, however, needs enough
+        # rows to form at least one full batch (drop_last=True).  When the
+        # budget schedule tapers per_round_pct below train_batch_size, we
+        # backfill with samples the selector has already annotated (i.e.
+        # anything in _ever_selected_set).  These are free — they already
+        # have rollout history and have already been counted against the
+        # global annotation budget — so padding keeps training alive without
+        # inflating the annotation cost.
+        floor = int(self._min_training_pool_size)
+        if floor > 0 and len(indices) < floor:
+            selected_set = set(indices)
+            # Previously annotated parquet indices, minus what we already have.
+            pool_npz = self._ever_selected_set - set(npz_indices)
+            pool_parquet: List[int] = []
+            if pool_npz:
+                remapped = self._remap_npz_to_dataset(list(pool_npz))
+                pool_parquet = [p for p in remapped if p not in selected_set]
+
+            need = floor - len(indices)
+            if len(pool_parquet) >= need:
+                pad = self._rng.choice(pool_parquet, size=need, replace=False).tolist()
+                source = "pool"
+            elif pool_parquet:
+                pad = list(pool_parquet)
+                source = "pool(exhausted)"
+            else:
+                pad = []
+                source = "none"
+
+            # If the already-annotated pool is still too small (very early
+            # rounds), fall back to random draws from the full parquet
+            # dataset so the trainer always gets a batch.  These extras are
+            # NOT added to _ever_selected_* — they're padding, not new
+            # annotations.
+            remaining = floor - (len(indices) + len(pad))
+            if remaining > 0:
+                full = set(range(self._dataset_size)) - selected_set - set(pad)
+                if full:
+                    extra_n = min(remaining, len(full))
+                    extra = self._rng.choice(
+                        list(full), size=extra_n, replace=False
+                    ).tolist()
+                    pad.extend(extra)
+                    source = source + "+random"
+
+            if pad:
+                print(f"[ClusterSelector] Padding training pool "
+                      f"{len(indices)} -> {len(indices) + len(pad)} "
+                      f"(floor={floor}, source={source})")
+                indices = list(indices) + list(pad)
 
         self._last_selected_indices = indices
         self._budget_history.append((

@@ -94,6 +94,10 @@ def default_compute_score(
         from . import vlaa
 
         res = vlaa.compute_score(solution_str, ground_truth, extra_info=extra_info)
+    elif data_source in ["TIGER-Lab/ViRL39K"]:
+        from . import virl39k
+
+        res = virl39k.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

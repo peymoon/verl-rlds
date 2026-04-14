@@ -529,6 +529,70 @@ If `use_rollout_history=False`, the reweight falls back to uniform sampling (all
 
 ---
 
+#### Bug fix: active probes left `_cluster_variances` empty → silent random fallback
+
+**Symptom (prior to fix):** Ridge runs with `predictor_active_probes=true`
+logged `Cluster variances updated: 0 clusters, 0 zero-variance, 0 high-variance`
+every round and fell back to `[ClusterSelector] No variance data yet, selecting random`.
+Combined with the budget schedule, per-round budget eventually dropped below
+`train_batch_size` and the rebuilt dataloader returned 0 batches (stall).
+
+**Root cause:** `update_rewards()` looked up cluster membership via
+`idx_to_cluster = dict(zip(self._rep_indices, self._rep_cluster_ids))`,
+a dict keyed only on **medoid** indices. Active probes pick samples by UCB
+over the full dataset — these are almost never medoids — so every probed
+sample failed the `c_id is None` guard, `cluster_rewards` stayed empty, and
+`_cluster_variances` was wiped to `{}` at the top of every round.
+
+**Fix (applied):** Look up cluster membership from `self._cluster_ids` (the
+per-sample assignments array), not from the rep-only dict. Active probes,
+exploration picks, and any other non-medoid ref selection now correctly
+contribute to cluster variance.
+
+---
+
+#### Bug fix: `select()` random fallback was too aggressive
+
+**Symptom:** Rounds with empty `_cluster_variances` (e.g. early cold-start,
+or when active-probes-bug fired) dropped into a pure random selection even
+when `_rollout_buffer` already had per-sample observations the `interpolated`
+strategy could have used.
+
+**Fix (applied):** The random-fallback gate in `select()` now checks both
+`_cluster_variances` **and** `_rollout_buffer`. For `strategy="interpolated"`,
+as long as the rollout buffer or `_rep_variances` has any observations, the
+selector dispatches to `_select_interpolated` — which has its own fallback
+chain (`_select_weighted` → random) — instead of jumping straight to random.
+An empty cluster-variance dict alone is no longer grounds for random.
+
+---
+
+#### Bug fix: per-round discovery budget below `train_batch_size` caused 0 batches
+
+**Symptom:** Under a `budget_schedule` with tapering phases, once cumulative
+utilisation crossed a phase boundary (e.g. 50% → 85%), `per_round_pct`
+dropped from 1.0 to 0.3. On a 22675-sample dataset that's 68 samples, below
+typical `train_batch_size=128+`. The rebuilt dataloader uses `drop_last=True`,
+so `StatefulDataLoader` reported `Rebuilt dataloader: 0 batches from 68 samples`
+and training stalled.
+
+**Fix (applied):** `DataSelector.set_min_training_pool_size(n)` is called by
+the trainer at init with `n = train_batch_size`. At the end of `select()`,
+if the strategy returns fewer than `n` indices, the selector pads up to the
+floor by drawing from `_ever_selected_set` — samples already annotated and
+already counted against the global budget, so padding is free in annotation
+terms. If the already-annotated pool is too small (very early rounds), the
+padding falls back to random draws from the full parquet dataset; those
+extras are **not** added to `_ever_selected_*` so they don't inflate the
+annotation count.
+
+**How to verify:** Log line `[ClusterSelector] Padding training pool
+{before} -> {after} (floor={n}, source={pool|pool+random|random})` appears
+in the round where the phase transition happens, followed by `Rebuilt
+dataloader: N batches from >= train_batch_size samples`.
+
+---
+
 #### Bug fix: NPZ row order ≠ parquet row order (silent wrong selection)
 
 **Symptom (prior to fix):** Online selection produced results indistinguishable from random despite the cluster pipeline appearing to "work" (logs showed variance measurements, DOTS references, etc.).
@@ -1056,21 +1120,89 @@ _select_interpolated / _select_frozen_reweight   ← unchanged allocation logic
 | Type | `predictor_type` | Description |
 |------|-----------------|-------------|
 | **KNN** | `knn` (default) | Legacy cosine-KNN / Nadaraya-Watson. Zero behavior change from the original code. |
-| **Ridge** | `ridge` | Weighted Ridge regression with joint p-hat head. Predicts mean reward `p_hat`, derives variance as `p_hat * (1 - p_hat)`. Provides posterior uncertainty for active probing. Closed-form solution, millisecond refit. |
-| **MLP** | `mlp` | 2-layer MLP (`d -> hidden -> 1`) predicting mean reward logit. Warm-started across rounds (parameters and optimizer state persist). 5-20 AdamW steps per `fit()` call. |
+| **Ridge** | `ridge` | Two-head weighted Ridge regression. Head A predicts mean reward `p_hat` (per-rollout supervision); Head B predicts normalized variance `v_hat` directly (per-sample supervision). Returns Head B's output as `predicted_var`, Head A's as `predicted_mean`. Closed-form solution, millisecond refit. Also exposes Head A's Bayesian posterior for active probing. |
+| **MLP** | `mlp` | Two-head 2-layer MLP (`d -> hidden -> 2`). Head [0] is the mean-reward logit (BCE loss on per-rollout binary rewards); Head [1] is the direct normalized-variance logit (weighted MSE on per-sample aggregates, sigmoid-squashed to [0,1]). Warm-started across rounds — parameters and optimizer state persist. 5-20 AdamW steps per `fit()` call. |
 
-### Joint p-hat Head (Ridge and MLP)
+### Two-head design (Ridge and MLP)
 
-For binary GRPO rewards, `Var = p(1-p)` exactly. Instead of predicting variance
-directly (a noisy estimator from 8 rollouts), the Ridge and MLP predictors
-predict mean reward `p_hat` and derive variance analytically. This:
+**Why two heads, not one.** The original single-head design regressed on mean
+reward `p_hat` and derived variance analytically as `v_hat = p_hat * (1 - p_hat)`.
+For binary GRPO rewards this derivation is theoretically correct for a single
+Bernoulli trial, but it has a hard consequence at prediction time: the parabola
+`p*(1−p)` peaks at **0.25** when `p=0.5`. So every scatter plot of
+`predicted_var` vs observed normalized variance ended up with the predicted
+axis capped at `[0, 0.25]` while the observed axis spanned `[0, 1]`, making
+`R²` meaningless and visually misleading (KNN's free-range interpolator
+appeared to "fit" vastly better even though its LOO R² was negative).
 
-- Gives 8x more training signal (one observation per rollout instead of one
-  aggregate variance per sample per step).
-- Eliminates the need for a separate DOTS call for mean reward (asymmetric
-  utility becomes a direct function of `p_hat`).
-- Is exact for binary rewards and a good approximation for continuous rewards
-  (IOU tasks), where variance normalization already handles scale.
+Beyond the cosmetic issue, the derivation conflates two distinct quantities
+that matter for data selection:
+
+- **Theoretical Bernoulli variance** `p(1−p)` — what head A's derivation
+  reports. Informs "where does the policy sit around 50/50?"
+- **Normalized empirical variance** `Var(rewards) / (p(1−p))` ∈ `[0, 1]` —
+  what the selector actually ranks by. Informs "how much of the theoretical
+  maximum uncertainty does this particular prompt realize under this policy?"
+
+A prompt with steady 4/8 splits across rounds has normalized variance ≈ 1
+(saturated learning signal), while a prompt that alternates 8/0 and 0/8
+across rounds at `p_avg ≈ 0.5` also looks like theoretical variance 0.25 to
+Head A but has normalized variance much lower. The ranking target and the
+derivation target are not the same thing.
+
+**What the two heads do.**
+
+| | Head A (mean) | Head B (variance) |
+|---|---|---|
+| Target | per-rollout binary reward | per-sample time-weighted normalized variance |
+| Loss | BCE (Ridge: weighted MSE; MLP: BCEwLogits) | weighted MSE on `v_obs ∈ [0, 1]` |
+| Rows | 1 per rollout (8× per probed sample) | 1 per probed sample |
+| Output at predict | `p_hat ∈ [0, 1]` | `v_hat ∈ [0, 1]` (Ridge: clip; MLP: sigmoid) |
+
+- **`predicted_mean`** still comes from Head A, so asymmetric utility
+  (`utility = v̂ · (1 + α·(0.5 − p̂))`), dead-zone filtering, and the Ridge
+  Bayesian posterior used by active probes all keep working unchanged.
+- **`predicted_var`** now comes from Head B. No 0.25 cap, full dynamic range,
+  directly optimized for the quantity the selector will rank on.
+
+**Cold-start behavior.** Before the first fit with enough observed samples,
+Head B falls back to the old `p(1−p)` derivation automatically. Subsequent
+rounds use the direct head once `obs_var_per_sample` is non-empty. For MLP
+specifically, the variance head sigmoid starts at 0.5 and warms up over the
+first 3–5 selection rounds as gradients accumulate — this is visible in the
+scatter plot as a range that expands from `[0.5, 0.5]` toward `[0, 1]` over
+the first few rounds.
+
+**Supervision density.** Head A keeps the 8× supervision benefit of
+per-rollout rows (200 probed samples × 8 rollouts = 1,600 training rows).
+Head B trains on 200 sample-level rows — much less — but the target is
+already aggregated over all rollouts, so the signal-to-noise ratio per row
+is much higher. They use the same trunk (MLP) or operate independently
+(Ridge) so the total fit cost is within 20% of the single-head version.
+
+**What this affects downstream (automatic).** The following consumers all
+pull `result.predicted_var` / `result.predicted_mean` directly, so they
+automatically pick up Head B's output:
+
+- `_select_interpolated` — global top-k and per-cluster allocation both
+  rank by Head B now.
+- `_select_frozen_reweight` — variance-weighted sampling in the frozen pool.
+- `predictor_train_r2`, `predictor_train_spearman`, `loo_knn_r2` — diagnostic
+  metrics computed at reference points against observed normalized variance.
+  These become honest: Ridge/MLP now target the same axis as KNN, so the
+  metrics are directly comparable.
+- `data_selection/pred_vs_obs_scatter` wandb image — the scatter is
+  automatically uncapped, so ridge/MLP plots will span `[0, 1]` on both axes.
+- Asymmetric utility and dead-zone filtering — unchanged, still read
+  `predicted_mean` from Head A.
+
+**Legacy metric still logged.** `predictor_train_r2_vs_pmean_var` compares
+`predicted_var` against `p_empirical · (1 − p_empirical)`. Under the old
+single-head design this was the *fair* variance metric; under the two-head
+design it now measures how much Head B's direct prediction diverges from
+Head A's derived prediction. A large divergence is informative — it means
+the dataset's empirical variance structure is not Bernoulli-like and
+Head B is capturing structure the derived head cannot.
 
 ### Active Probe Selection (Ridge only)
 
@@ -1104,6 +1236,19 @@ Every selection round logs predictor diagnostics to wandb:
 
 A **predicted vs observed scatter plot** (`data_selection/pred_vs_obs_scatter`)
 is generated as a wandb image at each selection round.
+
+> **Under the two-head design**, `predictor_train_r2` for Ridge/MLP is now
+> directly comparable to KNN — all three predictors are being scored against
+> the same target (observed normalized variance on `[0, 1]`). Before the
+> two-head fix, Ridge/MLP's `predicted_var` was capped at 0.25 while the
+> target spanned `[0, 1]`, so `R²` was dominated by a constant systematic
+> offset. A meaningful KNN-vs-Ridge comparison should now use
+> `predictor_train_r2` (training error, risks overfitting on KNN) together
+> with `loo_knn_r2` (embedding ceiling, independent of which predictor is
+> active) — if `loo_knn_r2` is negative, no predictor will help regardless
+> of type. KNN's apparent `predictor_train_r2 ≈ 0.9` is a memorisation
+> artefact (each ref is nearly its own top neighbor); the honest number is
+> `loo_knn_r2`.
 
 ### Configuration
 

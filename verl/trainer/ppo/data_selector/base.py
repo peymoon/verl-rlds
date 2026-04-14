@@ -56,6 +56,16 @@ class DataSelector(ABC):
         self.config = config
         self._step_count = 0
         self._selection_frozen = False
+        # Minimum number of training samples the trainer must receive per
+        # selection round, regardless of per-round annotation budget. The
+        # trainer sets this to `train_batch_size` so that a dataloader
+        # rebuilt with `drop_last=True` is never empty. The selector is
+        # expected to pad below-floor selections from its already-annotated
+        # pool (reusing samples already counted against the global budget).
+        self._min_training_pool_size: int = 0
+
+    def set_min_training_pool_size(self, n: int) -> None:
+        self._min_training_pool_size = int(max(0, n))
 
     @abstractmethod
     def initialize(self, dataset, collate_fn=None) -> None:

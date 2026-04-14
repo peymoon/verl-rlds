@@ -427,10 +427,15 @@ class KNNPredictor(VariancePredictor):
 # ---------------------------------------------------------------------------
 
 class RidgePredictor(VariancePredictor):
-    """Weighted Ridge regression on L2-normalized embeddings.
+    """Two-head weighted Ridge regression on L2-normalized embeddings.
 
-    Predicts mean reward p_hat via weighted least squares; derives variance
-    as p_hat * (1 - p_hat). Provides posterior uncertainty for active probing.
+    Head A (mean, per-rollout BCE-style MSE on binary rewards) predicts p_hat.
+    Head B (variance, per-sample weighted MSE on normalized variance) predicts
+    v_hat directly. Returning the direct v_hat instead of p_hat*(1-p_hat)
+    removes the 0.25 cap that p(1-p) imposes and gives the selector a
+    ranking signal on the full [0, 1] axis. The p_hat head is still needed
+    for asymmetric utility / dead-zone filtering and for the active-probe
+    posterior (which is cheapest to derive from the mean head).
     """
 
     def __init__(
@@ -443,8 +448,9 @@ class RidgePredictor(VariancePredictor):
         self._decay_rate = decay_rate
         self._max_refs = max_refs
 
-        self._beta: Optional[np.ndarray] = None  # (d,) regression coefficients
-        self._sigma_inv: Optional[np.ndarray] = None  # (d, d) precision matrix
+        self._beta: Optional[np.ndarray] = None      # (d,) mean head
+        self._beta_var: Optional[np.ndarray] = None  # (d,) variance head
+        self._sigma_inv: Optional[np.ndarray] = None  # (d, d) mean-head precision
         self._fitted = False
 
         # Cached at fit time for diagnostics
@@ -538,7 +544,7 @@ class RidgePredictor(VariancePredictor):
             [obs_var_per_sample[i][1] for i in self._ref_indices], dtype=np.float32
         )
 
-        # Weighted Ridge: beta = (X^T W X + alpha I)^{-1} X^T W y
+        # --- Head A: mean-reward regression (per-rollout rows) ---
         W_diag = w  # (n,)
         XtW = X.T * W_diag[np.newaxis, :]  # (d, n)
         XtWX = XtW @ X  # (d, d)
@@ -549,9 +555,49 @@ class RidgePredictor(VariancePredictor):
             self._sigma_inv = A
             self._beta = np.linalg.solve(A, XtWy).astype(np.float32)  # (d,)
         except np.linalg.LinAlgError:
-            # Fallback: pseudo-inverse
             self._beta = (np.linalg.pinv(A) @ XtWy).astype(np.float32)
             self._sigma_inv = A
+
+        # --- Head B: direct variance regression (per-sample rows) ---
+        # One row per distinct probed sample, target = time-weighted normalized
+        # variance, weight = sum of time weights across observations of that
+        # sample (so samples probed more often get more influence). The 0.25
+        # cap of head A comes from p(1-p); head B has no such cap and its
+        # output is the value that gets ranked by the selector.
+        var_X_rows = []
+        var_y_rows = []
+        var_w_rows = []
+        # Re-derive per-sample aggregate weight from obs_var_per_sample + history.
+        # obs_var_per_sample stores (weighted_var, weighted_mean) normalized by
+        # total_w; we need total_w to reweight. Recompute on the fly.
+        for npz_idx, history in buffer.items():
+            agg = obs_var_per_sample.get(int(npz_idx))
+            if agg is None:
+                continue
+            v_sample, _ = agg
+            total_w = 0.0
+            for t, _rewards in history:
+                total_w += float(np.exp(-self._decay_rate * max(0, current_step - t)))
+            if total_w <= 1e-12:
+                continue
+            var_X_rows.append(self._all_normed[int(npz_idx)])
+            var_y_rows.append(float(v_sample))
+            var_w_rows.append(float(total_w))
+
+        if var_X_rows:
+            Xv = np.array(var_X_rows, dtype=np.float64)
+            yv = np.array(var_y_rows, dtype=np.float64)
+            wv = np.array(var_w_rows, dtype=np.float64)
+            XvtW = Xv.T * wv[np.newaxis, :]
+            XvtWXv = XvtW @ Xv
+            XvtWyv = XvtW @ yv
+            Av = XvtWXv + self._alpha * np.eye(d, dtype=np.float64)
+            try:
+                self._beta_var = np.linalg.solve(Av, XvtWyv).astype(np.float32)
+            except np.linalg.LinAlgError:
+                self._beta_var = (np.linalg.pinv(Av) @ XvtWyv).astype(np.float32)
+        else:
+            self._beta_var = None
 
         self._fitted = True
 
@@ -568,7 +614,14 @@ class RidgePredictor(VariancePredictor):
 
         p_hat = (all_normed @ self._beta).astype(np.float32)
         p_hat = np.clip(p_hat, 0.0, 1.0)
-        v_hat = (p_hat * (1.0 - p_hat)).astype(np.float32)
+
+        # Variance head: direct regression on normalized variance if available,
+        # else fall back to the p(1-p) derivation (cold start, first fit).
+        if self._beta_var is not None:
+            v_hat = (all_normed @ self._beta_var).astype(np.float32)
+            v_hat = np.clip(v_hat, 0.0, 1.0)
+        else:
+            v_hat = (p_hat * (1.0 - p_hat)).astype(np.float32)
 
         # Posterior uncertainty: sigma(x) = sqrt(alpha * x^T (X^T W X + alpha I)^{-1} x)
         uncertainty = None
@@ -594,6 +647,7 @@ class RidgePredictor(VariancePredictor):
     def get_state_dict(self) -> dict:
         return {
             "beta": self._beta,
+            "beta_var": self._beta_var,
             "sigma_inv": self._sigma_inv,
             "fitted": self._fitted,
             "alpha": self._alpha,
@@ -601,6 +655,7 @@ class RidgePredictor(VariancePredictor):
 
     def load_state_dict(self, state: dict) -> None:
         self._beta = state.get("beta")
+        self._beta_var = state.get("beta_var")
         self._sigma_inv = state.get("sigma_inv")
         self._fitted = state.get("fitted", False)
         if "alpha" in state:
@@ -622,11 +677,15 @@ class RidgePredictor(VariancePredictor):
 # ---------------------------------------------------------------------------
 
 class MLPPredictor(VariancePredictor):
-    """Small MLP predicting mean reward logit, warm-started across rounds.
+    """Two-head MLP, warm-started across rounds.
 
-    Architecture: d -> hidden -> 1 (logit). Variance = sigmoid(logit) * (1 - sigmoid(logit)).
-    Uses weighted MSE on mean reward per observation, with time-decay and
-    n_rollouts in the loss weights.
+    Architecture: d -> hidden -> 2 logits. Head A is the mean-reward logit
+    (trained with per-rollout BCE), head B is the direct variance logit
+    (trained with per-sample weighted MSE on normalized variance, sigmoid
+    to keep output in [0, 1]). At predict time, predicted_var comes from
+    head B — uncapped by the 0.25 ceiling of p(1-p) — while predicted_mean
+    still comes from head A so asymmetric-utility and dead-zone filtering
+    keep working.
     """
 
     def __init__(
@@ -672,14 +731,16 @@ class MLPPredictor(VariancePredictor):
         class _MLP(nn.Module):
             def __init__(self, in_dim, hid_dim):
                 super().__init__()
-                self.net = nn.Sequential(
+                self.trunk = nn.Sequential(
                     nn.Linear(in_dim, hid_dim),
                     nn.ReLU(),
-                    nn.Linear(hid_dim, 1),
                 )
+                # Two heads: [0] = mean-reward logit, [1] = variance logit.
+                self.head = nn.Linear(hid_dim, 2)
 
             def forward(self, x):
-                return self.net(x).squeeze(-1)
+                h = self.trunk(x)
+                return self.head(h)  # (B, 2)
 
         self._model = _MLP(d, self._hidden_dim)
         self._model.eval()
@@ -770,24 +831,61 @@ class MLPPredictor(VariancePredictor):
         y_t = torch.from_numpy(np.array(y_rows, dtype=np.float32))
         w_t = torch.from_numpy(np.array(w_rows, dtype=np.float32))
 
-        # Scale-stable normalization across rounds: divide by the effective
-        # sample size n_eff = (Σw)² / Σw² rather than by Σw. Keeps the per-step
-        # gradient magnitude consistent as the buffer grows, so AdamW's moment
-        # buffers from previous rounds remain meaningful (warm-start).
+        # Scale-stable normalization across rounds for the mean head.
         w_sum = float(w_t.sum().item())
         w_sq_sum = float((w_t * w_t).sum().item())
         n_eff = (w_sum * w_sum) / max(w_sq_sum, 1e-12)
         w_t = w_t / max(n_eff, 1.0)
+
+        # --- Per-sample rows for the variance head ---
+        # One row per distinct probed sample, target = time-weighted
+        # normalized variance, weight = sum of time weights across its
+        # observations (so repeatedly-probed samples get more influence).
+        var_X_np = []
+        var_y_np = []
+        var_w_np = []
+        for npz_idx, history in buffer.items():
+            agg = obs_var_per_sample.get(int(npz_idx))
+            if agg is None:
+                continue
+            v_sample, _ = agg
+            total_w = 0.0
+            for t, _rewards in history:
+                total_w += float(np.exp(-self._decay_rate * max(0, current_step - t)))
+            if total_w <= 1e-12:
+                continue
+            var_X_np.append(all_normed[int(npz_idx)])
+            var_y_np.append(float(v_sample))
+            var_w_np.append(float(total_w))
+
+        if var_X_np:
+            Xv_t = torch.from_numpy(np.array(var_X_np, dtype=np.float32))
+            yv_t = torch.from_numpy(np.array(var_y_np, dtype=np.float32))
+            wv_t = torch.from_numpy(np.array(var_w_np, dtype=np.float32))
+            wv_sum = float(wv_t.sum().item())
+            wv_sq = float((wv_t * wv_t).sum().item())
+            nv_eff = (wv_sum * wv_sum) / max(wv_sq, 1e-12)
+            wv_t = wv_t / max(nv_eff, 1.0)
+        else:
+            Xv_t = None
 
         # Warm-start training (do NOT reinitialize model or optimizer).
         import torch.nn.functional as F
         self._model.train()
         for _ in range(self._n_steps):
             self._optimizer.zero_grad()
-            logits = self._model(X_t)
-            loss = F.binary_cross_entropy_with_logits(
-                logits, y_t, weight=w_t, reduction="sum"
+            logits = self._model(X_t)           # (N_rollouts, 2)
+            p_logit = logits[:, 0]
+            loss_mean = F.binary_cross_entropy_with_logits(
+                p_logit, y_t, weight=w_t, reduction="sum"
             )
+            loss = loss_mean
+            if Xv_t is not None:
+                v_logit = self._model(Xv_t)[:, 1]
+                v_pred = torch.sigmoid(v_logit)
+                # Weighted MSE on direct normalized variance.
+                loss_var = ((v_pred - yv_t) ** 2 * wv_t).sum()
+                loss = loss + loss_var
             loss.backward()
             self._optimizer.step()
         self._model.eval()
@@ -808,10 +906,15 @@ class MLPPredictor(VariancePredictor):
 
         with torch.no_grad():
             X_t = torch.from_numpy(all_normed)
-            logits = self._model(X_t).numpy()
-            p_hat = 1.0 / (1.0 + np.exp(-logits.astype(np.float64)))
+            logits = self._model(X_t).numpy()  # (N, 2)
+            p_logit = logits[:, 0].astype(np.float64)
+            v_logit = logits[:, 1].astype(np.float64)
+            p_hat = 1.0 / (1.0 + np.exp(-p_logit))
             p_hat = np.clip(p_hat, 0.0, 1.0).astype(np.float32)
-            v_hat = (p_hat * (1.0 - p_hat)).astype(np.float32)
+            # Direct variance head: sigmoid keeps v_hat ∈ [0, 1] naturally,
+            # not capped at 0.25 like the p(1-p) derivation.
+            v_hat = 1.0 / (1.0 + np.exp(-v_logit))
+            v_hat = np.clip(v_hat, 0.0, 1.0).astype(np.float32)
 
         return PredictionResult(
             predicted_var=v_hat,
@@ -834,8 +937,16 @@ class MLPPredictor(VariancePredictor):
             d = state.get("embed_dim", self._embed_dim)
             self._hidden_dim = state.get("hidden_dim", self._hidden_dim)
             self._ensure_model(d)
-            self._model.load_state_dict(state["model_state"])
-            self._optimizer.load_state_dict(state["optimizer_state"])
+            # Old checkpoints have a single-head linear layer (shape (1, H)),
+            # new architecture has a two-head layer (shape (2, H)). Skip
+            # loading rather than crash — the predictor will cold-start.
+            try:
+                self._model.load_state_dict(state["model_state"])
+                self._optimizer.load_state_dict(state["optimizer_state"])
+            except (RuntimeError, ValueError) as e:
+                print(f"[MLPPredictor] Skipping state load (shape mismatch, "
+                      f"likely pre-two-head checkpoint): {e}")
+                self._fitted = False
             self._model.eval()
 
     def get_metrics(self) -> Dict[str, float]:
