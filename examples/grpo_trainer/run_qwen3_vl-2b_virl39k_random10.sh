@@ -17,31 +17,32 @@
 set -x
 set -euo pipefail
 
-DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/benchmark/rl_data_selection/data}"
+DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/data}"
 DS_ROOT="${DATA_ROOT}/virl39k"
 SUBSET_PCT="${SUBSET_PCT:-10}"
 TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
 
-TRAIN_PARQUET="${DS_ROOT}/parquet/train_random${SUBSET_PCT}_100.parquet"
+# TRAIN_PARQUET can be overridden via env var (used by submit_random.sh)
+TRAIN_PARQUET="${TRAIN_PARQUET:-${DS_ROOT}/parquet/train_random${SUBSET_PCT}_100.parquet}"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
 
 for p in "$TRAIN_PARQUET" "$VAL_PARQUET"; do
     if [ ! -e "$p" ]; then
         echo "ERROR: missing $p" >&2
-        echo "       Run: python -m dataset_prep.make_random_subset --dataset virl39k --subset_pct ${SUBSET_PCT} --seed 42" >&2
         exit 1
     fi
 done
 
+export WANDB_API_KEY='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'
 EXP_NAME="${EXP_NAME:-virl39k_random${SUBSET_PCT}_qwen3_vl_2b}"
 PROJECT_NAME="${PROJECT_NAME:-verl_grpo_virl39k_baseline}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
 ENGINE="${1:-vllm}"
 
-CKPT_DIR="/workspace/rl_data_selection/peyman/outputs/virl39k/checkpoints/virl39k/${EXP_NAME}"
-ROLLOUT_DIR="/workspace/rl_data_selection/peyman/outputs/virl39k/rollouts/virl39k/${EXP_NAME}"
+CKPT_DIR="/workspace/rl_data_selection/outputs/virl39k/checkpoints/virl39k/${EXP_NAME}"
+ROLLOUT_DIR="/workspace/rl_data_selection/outputs/virl39k/rollouts/virl39k/${EXP_NAME}"
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,2,3,4"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$TRAIN_PARQUET" \

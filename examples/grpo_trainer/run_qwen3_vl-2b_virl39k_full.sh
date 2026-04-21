@@ -15,11 +15,12 @@
 set -x
 set -euo pipefail
 
-DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/benchmark/rl_data_selection/data}"
+
+DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/data}"
 DS_ROOT="${DATA_ROOT}/virl39k"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100}"
 TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
-
+export WANDB_API_KEY='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'
 TRAIN_PARQUET="${DS_ROOT}/parquet/${TRAIN_SPLIT}.parquet"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
 
@@ -27,15 +28,15 @@ for p in "$TRAIN_PARQUET" "$VAL_PARQUET"; do
     [ -e "$p" ] || { echo "ERROR: missing $p — run dataset_prep/prepare.sh virl39k" >&2; exit 1; }
 done
 
-EXP_NAME="${EXP_NAME:-virl39k_full_90_qwen3_vl_2b}"
+EXP_NAME="${WANDB_EXPERIMENT_NAME:-${EXP_NAME:-virl39k_full_90_qwen3_vl_2b}}"
 PROJECT_NAME="${PROJECT_NAME:-verl_grpo_virl39k_baseline}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 ENGINE="${1:-vllm}"
 
-CKPT_DIR="/workspace/rl_data_selection/peyman/outputs/virl39k/checkpoints/virl39k/${EXP_NAME}"
-ROLLOUT_DIR="/workspace/rl_data_selection/peyman/outputs/virl39k/rollouts/virl39k/${EXP_NAME}"
+CKPT_DIR="/workspace/rl_data_selection/outputs/virl39k/checkpoints/virl39k/${EXP_NAME}"
+ROLLOUT_DIR="/workspace/rl_data_selection/outputs/virl39k/rollouts/virl39k/${EXP_NAME}"
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,2,3,4"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$TRAIN_PARQUET" \
@@ -77,11 +78,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="$EXP_NAME" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
+    trainer.save_freq=5 \
     trainer.test_freq=10 \
-    trainer.total_epochs="$TOTAL_EPOCHS" \
     trainer.default_local_dir="$CKPT_DIR" \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     trainer.rollout_data_dir="$ROLLOUT_DIR" \
-    trainer.val_before_train=True \
-    trainer.validation_data_dir="${ROLLOUT_DIR}_val" "${@:2}"
+    trainer.val_before_train=False \
+    trainer.validation_data_dir="${ROLLOUT_DIR}_val" "${@:2}" \
+    +trainer.total_training_steps=300

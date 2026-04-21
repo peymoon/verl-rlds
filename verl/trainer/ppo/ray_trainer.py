@@ -1279,6 +1279,11 @@ class RayPPOTrainer:
             if os.path.exists(selector_local_path):
                 selector_state = torch.load(selector_local_path, weights_only=False)
                 self.data_selector.load_state_dict(selector_state)
+                # Pool is non-empty after restore → the initial selection already ran in a
+                # prior segment. Suppress re-firing it to prevent double-counting the budget.
+                if (hasattr(self.data_selector, "_ever_selected_set")
+                        and len(self.data_selector._ever_selected_set) > 0):
+                    self._data_selection_initial_pending = False
             else:
                 print(f"Warning: No data selector state found at {selector_local_path}, "
                       "selector will restart from scratch (frozen pool and rollout buffer lost)")

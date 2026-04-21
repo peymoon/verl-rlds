@@ -652,14 +652,23 @@ class ClusterSelector(DataSelector):
                       "or run Stage 1 (01_cluster.py) to produce cluster_arrays.npz.")
 
     def _build_alignment_from_json(self, dataset, json_path: str) -> None:
-        """Build npz↔parquet index alignment maps from the JSON source file.
+        """Build npz↔parquet index alignment maps.
 
-        The cluster_arrays.npz is built from a JSON/JSONL where each line has
-        an 'image' field (e.g. 'clevr_math/CLEVR_train_026670.png').  The
-        training parquet stores the same path in extra_info['image'].  We match
-        on this field to produce:
+        Produces:
             _npz_to_dataset[npz_i]   = parquet_i   (shape N_npz, fill -1 if no match)
             _dataset_to_npz[parquet_i] = npz_i     (only for matched rows)
+
+        Strategy (in priority order):
+        1. **QID-based** (preferred): if the NPZ has a 'uids' array of qids AND the
+           parquet stores 'qid' in extra_info, match directly on qid.  This is
+           content-based and immune to differences in row ordering between the JSON
+           source file (e.g. all.jsonl) and the file the NPZ was actually built from
+           (e.g. train_90_100.jsonl).
+        2. **Image-path-based via JSONL**: for each NPZ row, look up the qid in the
+           JSON source to get the image path, then match against extra_info['image']
+           in the parquet.  Handles cases where the parquet has no 'qid' field.
+        3. **Positional fallback** (legacy): assume JSONL row i == NPZ row i.  Only
+           correct when the JSONL and NPZ share the exact same row ordering.
 
         Once built, get_reference_indices() and select() remap their NPZ-order
         outputs to parquet-order indices via _npz_to_dataset.
@@ -668,25 +677,11 @@ class ClusterSelector(DataSelector):
 
         print(f"[ClusterSelector] Building NPZ↔parquet alignment from {json_path} ...")
 
-        # --- Step 1: load JSON records and extract image paths ---
-        json_image_paths: List[str] = []
-        with open(json_path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = _json.loads(line)
-                    json_image_paths.append(rec.get("image", ""))
-                except _json.JSONDecodeError:
-                    json_image_paths.append("")
-
-        # Truncate to embeddings size in case JSON has more records.
         n_npz = len(self._embeddings)
-        json_image_paths = json_image_paths[:n_npz]
 
-        # --- Step 2: build parquet image_path → parquet_idx map ---
-        parquet_img_to_idx: Dict[str, int] = {}
+        # --- Step 1: scan parquet once to build lookup maps ---
+        parquet_img_to_idx: Dict[str, int] = {}   # image_path  → parquet_i
+        parquet_qid_to_idx: Dict[str, int] = {}   # qid string  → parquet_i
         for parquet_i in range(len(dataset)):
             try:
                 item = dataset.dataframe[parquet_i]  # direct pandas access, no preprocessing
@@ -697,27 +692,75 @@ class ClusterSelector(DataSelector):
                     continue
             ei = item.get("extra_info") or {}
             img = ei.get("image", "")
+            qid = str(ei.get("qid", ""))
             if img:
                 parquet_img_to_idx[img] = parquet_i
+            if qid:
+                parquet_qid_to_idx[qid] = parquet_i
 
-        # --- Step 3: cross-reference to build alignment arrays ---
+        # --- Step 2: load JSON records, building {qid: image_path} lookup ---
+        # We read the full JSONL regardless of strategy so we have the image paths
+        # available for the image-path fallback.  'image_rel' (new dataset_prep
+        # pipeline) and 'image' (legacy VLAA-style) are both supported.
+        json_qid_to_img: Dict[str, str] = {}      # qid → image path (from JSONL)
+        json_image_paths_positional: List[str] = []  # for legacy positional fallback
+        with open(json_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                    img = rec.get("image", "") or rec.get("image_rel", "")
+                    qid = str(rec.get("qid", ""))
+                    if qid:
+                        json_qid_to_img[qid] = img
+                    json_image_paths_positional.append(img)
+                except _json.JSONDecodeError:
+                    json_image_paths_positional.append("")
+
+        json_image_paths_positional = json_image_paths_positional[:n_npz]
+
+        # --- Step 3: build alignment ---
         self._npz_to_dataset = np.full(n_npz, -1, dtype=np.int64)
         self._dataset_to_npz = {}
-
         n_matched = 0
-        for npz_i, img_path in enumerate(json_image_paths):
-            parquet_i = parquet_img_to_idx.get(img_path, -1)
-            self._npz_to_dataset[npz_i] = parquet_i
-            if parquet_i >= 0:
-                self._dataset_to_npz[parquet_i] = npz_i
-                n_matched += 1
+
+        if self._uid_to_dataset_idx and parquet_qid_to_idx:
+            # Strategy 1: QID-based — content-safe, ordering-independent.
+            # _uid_to_dataset_idx = {qid: npz_idx} (built from NPZ 'uids' in
+            # _load_precomputed_clusters / _load_embeddings_and_cluster).
+            for qid, npz_idx in self._uid_to_dataset_idx.items():
+                if npz_idx >= n_npz:
+                    continue
+                parquet_i = parquet_qid_to_idx.get(qid, -1)
+                if parquet_i < 0 and json_qid_to_img:
+                    # Try image-path fallback for this qid (Strategy 2).
+                    img = json_qid_to_img.get(qid, "")
+                    if img:
+                        parquet_i = parquet_img_to_idx.get(img, -1)
+                self._npz_to_dataset[npz_idx] = parquet_i
+                if parquet_i >= 0:
+                    self._dataset_to_npz[parquet_i] = npz_idx
+                    n_matched += 1
+            method = "qid"
+        elif json_image_paths_positional and parquet_img_to_idx:
+            # Strategy 3: positional fallback — only correct when JSONL and NPZ
+            # share the exact same row ordering.
+            for npz_i, img_path in enumerate(json_image_paths_positional):
+                parquet_i = parquet_img_to_idx.get(img_path, -1)
+                self._npz_to_dataset[npz_i] = parquet_i
+                if parquet_i >= 0:
+                    self._dataset_to_npz[parquet_i] = npz_i
+                    n_matched += 1
+            method = "positional-image-path"
+        else:
+            method = "none"
 
         n_unmatched = n_npz - n_matched
-        print(f"[ClusterSelector] Alignment: {n_matched}/{n_npz} NPZ rows matched to parquet rows "
-              f"({n_unmatched} NPZ rows have no parquet counterpart and will be excluded from selection).")
-        if n_unmatched > 0:
-            print(f"[ClusterSelector] Unmatched rows are typically samples in the JSON that were "
-                  f"filtered out during parquet creation (missing images, preprocessing failures, etc.).")
+        print(f"[ClusterSelector] Alignment ({method}): {n_matched}/{n_npz} NPZ rows matched "
+              f"to parquet rows ({n_unmatched} unmatched — typically test-set samples "
+              f"not present in the training parquet).")
 
     def _remap_npz_to_dataset(self, npz_indices: List[int]) -> List[int]:
         """Map NPZ positions → parquet positions, dropping any without a match."""
@@ -1416,7 +1459,9 @@ class ClusterSelector(DataSelector):
               f"train_R²={d.get('data_selection/predictor_train_r2', 0):.4f}, "
               f"train_R²_vs_pmean={d.get('data_selection/predictor_train_r2_vs_pmean_var', 0):.4f}, "
               f"LOO_R²={d.get('data_selection/loo_knn_r2', 0):.4f}, "
-              f"LOO_ρ={d.get('data_selection/loo_knn_spearman', 0):.4f}")
+              f"LOO_ρ="
+              + ("undef" if d.get('data_selection/loo_knn_spearman_undefined', 0) > 0.5
+                 else f"{d.get('data_selection/loo_knn_spearman', 0):.4f}"))
 
     # ------------------------------------------------------------------
     # Exploration rollouts
@@ -2462,6 +2507,49 @@ class ClusterSelector(DataSelector):
                 images["data_selection/selected_difficulty"] = wandb.Image(fig)
                 plt.close(fig)
 
+        # --- Plot: 2D PCA cluster map (one-shot, but re-logged each round so
+        # it's visible on every wandb panel). Points are colored by their
+        # cluster assignment; selected samples are overlaid with black edges.
+        # Per-round overhead is trivial (no recomputation; the PCA projection
+        # is cached from initialize()).
+        if (self._embedding_2d is not None
+                and self._cluster_ids is not None):
+            E = self._embedding_2d
+            labels = self._cluster_ids
+            n_bg = min(12000, E.shape[0])
+            if n_bg < E.shape[0]:
+                bg_idx = self._rng.choice(E.shape[0], size=n_bg, replace=False)
+            else:
+                bg_idx = np.arange(E.shape[0])
+
+            fig, ax = plt.subplots(figsize=(7, 6))
+            # tab20 cycles every 20 clusters — fine for visual grouping even
+            # when K >> 20 (adjacent cluster ids share colors but spatial
+            # separation still reads).
+            ax.scatter(E[bg_idx, 0], E[bg_idx, 1],
+                       c=labels[bg_idx] % 20, cmap="tab20",
+                       s=2, alpha=0.5, edgecolors="none")
+
+            if self._prev_selected_set:
+                sel = np.fromiter(self._prev_selected_set, dtype=np.int64,
+                                  count=len(self._prev_selected_set))
+                sel = sel[(sel >= 0) & (sel < E.shape[0])]
+                if sel.size > 0:
+                    ax.scatter(E[sel, 0], E[sel, 1], s=12, facecolors="none",
+                               edgecolors="black", linewidths=0.4,
+                               label=f"selected (n={sel.size})")
+                    ax.legend(fontsize=8, loc="best")
+
+            n_clusters = int(len(np.unique(labels)))
+            ax.set_xlabel("PC1")
+            ax.set_ylabel("PC2")
+            ax.set_title(
+                f"Cluster map (K={n_clusters}, 2D PCA) — round {self._selection_round}"
+            )
+            fig.tight_layout()
+            images["data_selection/cluster_map_pca"] = wandb.Image(fig)
+            plt.close(fig)
+
         # --- Plot: 2D PCA scatter of selected vs unselected samples ---
         # Uses the cached PCA projection (computed once at initialize()) and
         # colours selected points by predicted mean reward when available, else
@@ -2546,6 +2634,7 @@ class ClusterSelector(DataSelector):
         # --- Plot: Predicted vs Observed variance scatter (predictor diagnostics) ---
         ref_indices = getattr(self._predictor, "_ref_indices", None)
         ref_observed_var = getattr(self._predictor, "_ref_observed_var", None)
+        ref_observed_mean = getattr(self._predictor, "_ref_observed_mean", None)
         if (ref_indices is not None and ref_observed_var is not None
                 and self._last_predicted_var is not None):
             scatter_img = make_predictor_scatter_plot(
@@ -2554,6 +2643,7 @@ class ClusterSelector(DataSelector):
                 predicted_var_all=self._last_predicted_var,
                 predictor_type=self.cluster_config.predictor_type,
                 selection_round=self._selection_round,
+                ref_observed_mean=ref_observed_mean,
             )
             if scatter_img is not None:
                 images["data_selection/pred_vs_obs_scatter"] = scatter_img

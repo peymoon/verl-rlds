@@ -187,8 +187,17 @@ def compute_predictor_diagnostics(
     if _has_scipy:
         rho_loo, _ = scipy_stats.spearmanr(loo_predictions, obs)
         if np.isnan(rho_loo):
-            rho_loo = 0.0
-        metrics["data_selection/loo_knn_spearman"] = float(rho_loo)
+            # NaN = at least one array has zero variance (e.g. kernel smoothing
+            # collapsed all loo_predictions to the same value). Silently
+            # returning 0.0 masks this pathology as "no correlation" — expose
+            # it explicitly via a sentinel flag so downstream triage can tell
+            # "rank corr is genuinely zero" from "rank corr is undefined".
+            metrics["data_selection/loo_knn_spearman_undefined"] = 1.0
+            metrics["data_selection/loo_knn_pred_std"] = float(np.std(loo_predictions))
+            metrics["data_selection/loo_knn_obs_std"] = float(np.std(obs))
+        else:
+            metrics["data_selection/loo_knn_spearman"] = float(rho_loo)
+            metrics["data_selection/loo_knn_spearman_undefined"] = 0.0
     metrics["data_selection/n_reference_points"] = float(n_refs)
 
     return metrics
@@ -200,8 +209,14 @@ def make_predictor_scatter_plot(
     predicted_var_all: np.ndarray,
     predictor_type: str = "knn",
     selection_round: int = 0,
+    ref_observed_mean: Optional[np.ndarray] = None,
 ):
     """Create predicted-vs-observed scatter plot for wandb logging.
+
+    When ``ref_observed_mean`` is provided, points are colored by the empirical
+    mean reward (1.0 = rollouts usually correct, 0.0 = usually wrong, 0.5 =
+    ZPD / high-variance). This makes it easy to see whether the predictor
+    mis-ranks the hard-but-learnable samples vs the dead-zone samples.
 
     Returns a wandb.Image or None if dependencies are missing.
     """
@@ -233,8 +248,20 @@ def make_predictor_scatter_plot(
     except ImportError:
         pass
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(obs, pred, s=4, alpha=0.5, c="steelblue", edgecolors="none")
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    if ref_observed_mean is not None and len(ref_observed_mean) == n_refs:
+        sc = ax.scatter(
+            obs, pred,
+            s=8, alpha=0.6,
+            c=ref_observed_mean,
+            cmap="RdYlGn",
+            vmin=0.0, vmax=1.0,
+            edgecolors="none",
+        )
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.85)
+        cbar.set_label("Empirical mean reward (1=correct, 0=wrong)")
+    else:
+        ax.scatter(obs, pred, s=4, alpha=0.5, c="steelblue", edgecolors="none")
 
     lims = [
         min(float(obs.min()), float(pred.min())) - 0.02,

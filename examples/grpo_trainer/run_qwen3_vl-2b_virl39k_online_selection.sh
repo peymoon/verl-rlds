@@ -36,17 +36,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/benchmark/rl_data_selection/data}"
+DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/data}"
 DATASET_NAME="virl39k"
 K_FINAL="${K_FINAL:-150}"
 N_REPS="${N_REPS:-3}"
+export WANDB_API_KEY='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'
 TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100}"
 TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
 
 DS_ROOT="${DATA_ROOT}/${DATASET_NAME}"
 TRAIN_PARQUET="${DS_ROOT}/parquet/${TRAIN_SPLIT}.parquet"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
-CLUSTER_ARRAYS="${DS_ROOT}/cluster_arrays/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz"
+CLUSTER_ARRAYS="${DS_ROOT}/cluster_arrays_90_100/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz"
 DATASET_JSON="${DS_ROOT}/records/all.jsonl"
 
 # Sanity checks — fail fast with an actionable message instead of letting
@@ -64,7 +65,8 @@ done
 # samples for variance estimation — cleaner early-round cluster scores than
 # n_reps=2. The phased schedule (50% of budget at per_round=1.0, interval=4)
 # runs ~5 discovery rounds before tapering.
-export BUDGET_SCHEDULE="${BUDGET_SCHEDULE:-[{until_budget_pct:50,per_round_pct:1.0,interval:4},{until_budget_pct:85,per_round_pct:0.3,interval:10},{until_budget_pct:100,per_round_pct:0.15,interval:16}]}"
+unset BUDGET_SCHEDULE
+export BUDGET_SCHEDULE='[{until_budget_pct:50,per_round_pct:1.0,interval:4},{until_budget_pct:85,per_round_pct:0.3,interval:10},{until_budget_pct:100,per_round_pct:0.15,interval:16}]'
 
 # Slightly smaller per-round increment than VLAA since 1% of 39k (390
 # samples) is already > 2 batches (256) and would overshoot the
@@ -81,11 +83,16 @@ export NORMALIZE_VARIANCE="${NORMALIZE_VARIANCE:-true}"
 export COUNT_MEDOIDS_IN_BUDGET="${COUNT_MEDOIDS_IN_BUDGET:-false}"
 
 # verl positional args: ENGINE CLUSTER_ARRAYS VARIANT DATASET_JSON
-ENGINE="${ENGINE:-vllm}"
+if [[ "${1:-}" != --* && "${1:-}" != *=* && -n "${1:-}" ]]; then
+    ENGINE="${1}"
+    shift
+else
+    ENGINE="${ENGINE:-vllm}"
+fi
 VARIANT="${VARIANT:-interpolated_weighted}"
 
 # Override project name so wandb groups these runs separately from VLAA.
-export WANDB_PROJECT_NAME_OVERRIDE="verl_grpo_virl39k_online_selection"
+export WANDB_PROJECT_NAME_OVERRIDE="verl_grpo_virl39k_baseline"
 
 # The main launcher takes positional args for cluster_arrays / dataset_json;
 # we pass our ViRL39K paths plus a project-name override through Hydra.
@@ -98,5 +105,7 @@ exec bash "$SCRIPT_DIR/run_qwen3_vl-2b_online_selection.sh" \
     data.val_files="$VAL_PARQUET" \
     data_selection.cluster.n_clusters="${K_FINAL}" \
     data_selection.cluster.n_reps="${N_REPS}" \
-    trainer.project_name=verl_grpo_virl39k_online_selection \
+    trainer.project_name=verl_grpo_virl39k_baseline \
+    trainer.experiment_name="${WANDB_EXPERIMENT_NAME:-virl39k_knn_k150}" \
+    +trainer.total_training_steps=300 \
     "$@"

@@ -308,8 +308,13 @@ fi
 PREDICTOR_TYPE=${PREDICTOR_TYPE:-knn}
 PREDICTOR_ALPHA=${PREDICTOR_ALPHA:-1.0}
 PREDICTOR_MLP_HIDDEN=${PREDICTOR_MLP_HIDDEN:-256}
-PREDICTOR_MLP_LR=${PREDICTOR_MLP_LR:-1e-3}
-PREDICTOR_MLP_STEPS=${PREDICTOR_MLP_STEPS:-10}
+# Updated defaults after stratified mlp_fixed run: train_R² climbed monotonically
+# 0.25→0.66 over the run with steps=10/lr=1e-3, but remained under-fit early.
+# Larger step budget + smaller LR gives the MLP enough gradient updates to
+# converge on each round's growing reference set while staying stable under
+# warm-start. Override via env if compute is tight.
+PREDICTOR_MLP_LR=${PREDICTOR_MLP_LR:-3e-4}
+PREDICTOR_MLP_STEPS=${PREDICTOR_MLP_STEPS:-50}
 PREDICTOR_MLP_WEIGHT_DECAY=${PREDICTOR_MLP_WEIGHT_DECAY:-1e-3}
 
 # Active probe selection (requires predictor with uncertainty, e.g. "ridge")
@@ -324,10 +329,14 @@ if [ "$ACTIVE_PROBES" = "true" ]; then
     EXP_SUFFIX="${EXP_SUFFIX}_activeProbes"
 fi
 
-EXP_NAME="v62_k300_r2_${REPRESENTATIVE_METHOD}_${PREDICTOR_TYPE}_${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
+EXP_NAME="${WANDB_RUN_ID:-v62}_k${K_FINAL:-300}_r${N_REPS:-2}_${REPRESENTATIVE_METHOD}_${PREDICTOR_TYPE}_${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
+# Wandb display name: use WANDB_EXPERIMENT_NAME if set (human-readable, stable across
+# job-chain segments), otherwise fall back to EXP_NAME. Checkpoint paths always use
+# EXP_NAME (timestamped via WANDB_RUN_ID) so separate attempts don't collide.
+WANDB_DISPLAY_NAME="${WANDB_EXPERIMENT_NAME:-${EXP_NAME}}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"2,4,5,7"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet \
@@ -394,7 +403,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.01} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -415,14 +424,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_vlaa_grpo_full' \
-    trainer.experiment_name="${EXP_NAME}" \
+    trainer.experiment_name="${WANDB_DISPLAY_NAME}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
-    trainer.test_freq=3 \
+    trainer.save_freq=${SAVE_FREQ:-5} \
+    trainer.test_freq=${TEST_FREQ:-3} \
     trainer.total_epochs=170 \
-    trainer.default_local_dir=/workspace/rl_data_selection/peyman/outputs/checkpoints/online_selection/${EXP_NAME} \
+    trainer.default_local_dir=/workspace/rl_data_selection/peyman/outputs/checkpoints/online_selection/${WANDB_DISPLAY_NAME} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    trainer.rollout_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME} \
+    trainer.rollout_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${WANDB_DISPLAY_NAME} \
     trainer.val_before_train=False \
-    trainer.validation_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${EXP_NAME}_val "$@"
+    trainer.validation_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${WANDB_DISPLAY_NAME}_val "$@"

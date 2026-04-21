@@ -49,4 +49,4 @@ export ACTIVE_PROBES=false
 export NORMALIZE_VARIANCE=${NORMALIZE_VARIANCE:-true}
 export COUNT_MEDOIDS_IN_BUDGET=${COUNT_MEDOIDS_IN_BUDGET:-false}
 
-exec bash "$SCRIPT_DIR/run_qwen3_vl-2b_online_selection.sh" "$@"
+exec bash "$SCRIPT_DIR/run_qwen3_vl-2b_virl39k_online_selection.sh" "$@"
