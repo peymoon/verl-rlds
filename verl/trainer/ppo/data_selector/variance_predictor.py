@@ -2,15 +2,18 @@
 Variance predictor framework for online data selection.
 
 Provides a pluggable interface for predicting per-sample reward variance
-(and mean reward) from cached embeddings and rollout observations. Three
+(and mean reward) from cached embeddings and rollout observations. Four
 implementations:
 
-  KNNPredictor   — wraps the existing cosine-KNN / Nadaraya-Watson approach
-                   (zero behavior change from the legacy inline code).
-  RidgePredictor — closed-form weighted Ridge regression with joint p-hat head
-                   and posterior uncertainty for active probe selection.
-  MLPPredictor   — 2-layer MLP warm-started across selection rounds; predicts
-                   mean reward logit, derives variance as p*(1-p).
+  KNNPredictor          — cosine-KNN / Nadaraya-Watson (default).
+  RidgePredictor        — closed-form weighted Ridge regression with joint
+                          p-hat head and posterior uncertainty.
+  MLPPredictor          — 2-layer MLP warm-started across selection rounds.
+  RandomScorePredictor  — returns a uniform random score per sample every
+                          round (independent of embeddings or observations).
+                          Used as an ablation to isolate the contribution of
+                          the predictor vs the selection infrastructure
+                          (progressive discovery + frozen reweight).
 
 All predictors consume raw observation rows (npz_idx, step, rewards_array)
 rather than pre-aggregated per-sample scalars, so time decay and n_rollouts
@@ -81,6 +84,7 @@ def compute_predictor_diagnostics(
     predicted_mean_all: np.ndarray,
     dots_temperature: float = 0.05,
     dots_top_k: int = 64,
+    cluster_ids: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Compute LOO-KNN R², Spearman rho, and MAE for the current predictor.
 
@@ -199,6 +203,43 @@ def compute_predictor_diagnostics(
             metrics["data_selection/loo_knn_spearman"] = float(rho_loo)
             metrics["data_selection/loo_knn_spearman_undefined"] = 0.0
     metrics["data_selection/n_reference_points"] = float(n_refs)
+
+    # --- Cluster-mean LOO (supervisor 2026-04-21: baseline-beyond-pool-mean) ---
+    # For each reference sample i, predict its variance as the mean of the
+    # OTHER reference samples that share its cluster. If this beats the global
+    # pool-mean predictor (equivalent Spearman ≈ 0), the cluster structure
+    # itself carries variance signal even when per-sample embedding kNN does
+    # not. R² > 0 means cluster-level variance generalises within a cluster.
+    if cluster_ids is not None and len(cluster_ids) >= len(embeddings):
+        ref_clusters = cluster_ids[ref_indices].astype(np.int64)
+        cluster_loo = np.zeros(n_refs, dtype=np.float32)
+        cluster_loo_valid = np.zeros(n_refs, dtype=bool)
+        for i in range(n_refs):
+            c = ref_clusters[i]
+            mask = (ref_clusters == c)
+            mask[i] = False
+            if mask.sum() == 0:
+                # Only sample in its cluster among refs — fall back to pool mean
+                cluster_loo[i] = float(obs.mean())
+            else:
+                cluster_loo[i] = float(obs[mask].mean())
+                cluster_loo_valid[i] = True
+
+        ss_res_cluster = float(np.sum((cluster_loo - obs) ** 2))
+        r2_cluster = 1.0 - ss_res_cluster / max(ss_tot, 1e-12)
+        mae_cluster = float(np.mean(np.abs(cluster_loo - obs)))
+        metrics["data_selection/loo_cluster_r2"] = r2_cluster
+        metrics["data_selection/loo_cluster_mae"] = mae_cluster
+        metrics["data_selection/loo_cluster_coverage"] = float(
+            cluster_loo_valid.sum() / max(n_refs, 1)
+        )
+        if _has_scipy:
+            rho_cluster, _ = scipy_stats.spearmanr(cluster_loo, obs)
+            if np.isnan(rho_cluster):
+                metrics["data_selection/loo_cluster_spearman_undefined"] = 1.0
+            else:
+                metrics["data_selection/loo_cluster_spearman"] = float(rho_cluster)
+                metrics["data_selection/loo_cluster_spearman_undefined"] = 0.0
 
     return metrics
 
@@ -984,6 +1025,138 @@ class MLPPredictor(VariancePredictor):
 
 
 # ---------------------------------------------------------------------------
+# RandomScorePredictor — ablation: random scores with the rest of the pipeline
+# ---------------------------------------------------------------------------
+
+class RandomScorePredictor(VariancePredictor):
+    """Returns a uniform random predicted_var per sample every round.
+
+    Purpose: isolate the contribution of the variance predictor from the
+    contribution of the surrounding infrastructure (progressive discovery
+    under `exclude_already_selected=true`, cluster-aware softmax allocation,
+    frozen reweight, time-decayed rollout history, etc.).
+
+    Behavior:
+    - `fit` still aggregates observations into `_ref_indices`,
+      `_ref_observed_var`, and `_ref_observed_mean` so the LOO-KNN and
+      cluster-mean-LOO diagnostics remain comparable across predictor types.
+    - `predict` draws `predicted_var ~ Uniform(0, 1)` per sample, independent
+      of embeddings or observations. `predicted_mean = 0.5` is neutral so
+      dead-zone clipping and asymmetric utility do not fire (both are driven
+      by predicted_mean from Head A per invariant 5 in CLAUDE.md).
+    - Each call to `predict` reseeds from `(selection_round, n_samples)` when
+      a round is set via `set_round(round_idx)`; otherwise uses a fresh draw.
+      The trainer calls `predict` once per selection round, so scores are
+      stable within a round and differ across rounds.
+    """
+
+    def __init__(
+        self,
+        decay_rate: float = 0.05,
+        max_refs: int = 0,
+    ):
+        self._decay_rate = decay_rate
+        self._max_refs = max_refs
+
+        self._ref_indices: Optional[np.ndarray] = None
+        self._ref_observed_var: Optional[np.ndarray] = None
+        self._ref_observed_mean: Optional[np.ndarray] = None
+        self._fitted = False
+        self._round: int = 0
+
+    def set_round(self, round_idx: int) -> None:
+        """Advance the per-round seed. Called by the selector before predict."""
+        self._round = int(round_idx)
+
+    def fit(
+        self,
+        observations: List[Tuple[int, int, np.ndarray]],
+        embeddings: np.ndarray,
+        current_step: int,
+        normalize_variance: bool = True,
+    ) -> None:
+        # Aggregate observations for LOO diagnostics only. These are NOT used
+        # in predict() — predict returns random values — but we still want
+        # loo_knn_r2, loo_cluster_r2, and predictor_train_r2 to be logged so
+        # the random-score run is directly comparable to knn/ridge/mlp on
+        # every diagnostic axis.
+        if not observations:
+            self._fitted = False
+            return
+
+        from collections import defaultdict
+        buffer: Dict[int, List[Tuple[int, np.ndarray]]] = defaultdict(list)
+        for npz_idx, step, rewards in observations:
+            buffer[npz_idx].append((step, rewards))
+
+        var_results: Dict[int, float] = {}
+        mean_results: Dict[int, float] = {}
+        recency: Dict[int, int] = {}
+
+        for npz_idx, history in buffer.items():
+            total_w = 0.0
+            weighted_var = 0.0
+            weighted_mean = 0.0
+            latest_step = 0
+            for t, rewards in history:
+                w = float(np.exp(-self._decay_rate * max(0, current_step - t)))
+                v = float(np.var(rewards)) if len(rewards) > 1 else 0.0
+                m = float(np.mean(rewards))
+                if normalize_variance and len(rewards) > 1:
+                    denom = max(m * (1.0 - m), 1e-8)
+                    v = min(v / denom, 1.0)
+                weighted_var += w * v
+                weighted_mean += w * m
+                total_w += w
+                latest_step = max(latest_step, t)
+            if total_w > 1e-12:
+                var_results[npz_idx] = weighted_var / total_w
+                mean_results[npz_idx] = weighted_mean / total_w
+                recency[npz_idx] = latest_step
+
+        if self._max_refs > 0 and len(var_results) > self._max_refs:
+            top_idxs = sorted(recency, key=lambda i: recency[i], reverse=True)[
+                :self._max_refs
+            ]
+            var_results = {i: var_results[i] for i in top_idxs}
+            mean_results = {i: mean_results[i] for i in top_idxs}
+
+        if not var_results:
+            self._fitted = False
+            return
+
+        self._ref_indices = np.array(list(var_results.keys()))
+        self._ref_observed_var = np.array(
+            list(var_results.values()), dtype=np.float32
+        )
+        self._ref_observed_mean = np.array(
+            [mean_results.get(int(i), 0.0) for i in self._ref_indices],
+            dtype=np.float32,
+        )
+        self._fitted = True
+
+    def predict(self, embeddings: np.ndarray) -> PredictionResult:
+        n = embeddings.shape[0]
+        # Deterministic per-round seed: same seed → same scores for a given
+        # round, so repeat calls in the same round (e.g. for training-reward
+        # accounting) see identical scores. Different rounds re-draw.
+        seed = (0x9E3779B1 ^ int(self._round)) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        predicted_var = rng.random(n, dtype=np.float32)
+        predicted_mean = np.full(n, 0.5, dtype=np.float32)
+        return PredictionResult(
+            predicted_var=predicted_var,
+            predicted_mean=predicted_mean,
+        )
+
+    def get_metrics(self) -> Dict[str, float]:
+        m: Dict[str, float] = {"data_selection/predictor_type": 3.0}
+        if self._fitted and self._ref_indices is not None:
+            m["data_selection/predictor_n_refs"] = float(len(self._ref_indices))
+        return m
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1013,6 +1186,11 @@ def build_predictor(cluster_config) -> VariancePredictor:
             decay_rate=cluster_config.rollout_history_decay_rate,
             max_refs=cluster_config.rollout_history_max_refs,
         )
+    elif ptype == "random_score":
+        return RandomScorePredictor(
+            decay_rate=cluster_config.rollout_history_decay_rate,
+            max_refs=cluster_config.rollout_history_max_refs,
+        )
     else:
         raise ValueError(f"Unknown predictor_type: {ptype!r}. "
-                         f"Valid: 'knn', 'ridge', 'mlp'")
+                         f"Valid: 'knn', 'ridge', 'mlp', 'random_score'")

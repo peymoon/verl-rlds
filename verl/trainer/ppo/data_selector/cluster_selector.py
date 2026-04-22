@@ -275,6 +275,7 @@ class ClusterSelector(DataSelector):
         # --- Selection overlap tracking ---
         self._prev_selected_set: set = set()  # NPZ indices from previous round
         self._selection_jaccard: float = 0.0
+        self._selection_jaccard_vs_random: float = 0.0  # per-round, overwritten
         self._selection_history: List[set] = []  # all rounds' NPZ index sets
         self._per_cluster_coverage: Dict[int, int] = {}  # cluster_id -> times selected
 
@@ -1422,6 +1423,11 @@ class ClusterSelector(DataSelector):
             obs, self._embeddings, self._current_training_step,
             normalize_variance=self.cluster_config.normalize_variance,
         )
+        # For the random_score ablation: advance the per-round seed so scores
+        # differ across rounds but are stable within a round. No-op for
+        # predictors that don't define set_round().
+        if hasattr(self._predictor, "set_round"):
+            self._predictor.set_round(self._selection_round)
         result = self._predictor.predict(self._embeddings)
 
         self._last_predicted_var = result.predicted_var.copy()
@@ -1451,6 +1457,7 @@ class ClusterSelector(DataSelector):
             predicted_mean_all=result.predicted_mean,
             dots_temperature=self.cluster_config.dots_temperature,
             dots_top_k=self.cluster_config.dots_top_k,
+            cluster_ids=self._cluster_ids,
         )
         d = self._last_predictor_diagnostics
         print(f"[ClusterSelector] Predictor diagnostics: "
@@ -1461,7 +1468,9 @@ class ClusterSelector(DataSelector):
               f"LOO_R²={d.get('data_selection/loo_knn_r2', 0):.4f}, "
               f"LOO_ρ="
               + ("undef" if d.get('data_selection/loo_knn_spearman_undefined', 0) > 0.5
-                 else f"{d.get('data_selection/loo_knn_spearman', 0):.4f}"))
+                 else f"{d.get('data_selection/loo_knn_spearman', 0):.4f}")
+              + f", cluster_LOO_R²={d.get('data_selection/loo_cluster_r2', float('nan')):.4f}"
+              + f", cluster_LOO_ρ={d.get('data_selection/loo_cluster_spearman', float('nan')):.4f}")
 
     # ------------------------------------------------------------------
     # Exploration rollouts
@@ -1684,6 +1693,41 @@ class ClusterSelector(DataSelector):
             self._selection_jaccard = len(intersection) / max(len(union), 1)
         else:
             self._selection_jaccard = 0.0
+
+        # --- Jaccard between current selection and a matched-size random
+        # draw from the SAME eligible pool (discovery: unseen; frozen
+        # reweight: full pool). Near 0 → method picks systematically
+        # differently from random. Near (|S|/|pool|) → indistinguishable
+        # from random. Used by the 2026-04-21 supervisor experiment to
+        # test the diversity-vs-difficulty reframing of the KNN predictor.
+        self._selection_jaccard_vs_random = 0.0
+        if len(current_set) > 0:
+            n_embeddings = len(self._embeddings)
+            # At this point in the flow, `_ever_selected_set` has NOT yet been
+            # updated with current_set — that update happens below, after the
+            # overlap block. So `_ever_selected_set` here is exactly the pool
+            # of samples the selector was excluding from discovery this round.
+            if (getattr(self.cluster_config, "exclude_already_selected", True)
+                    and self._ever_selected_set):
+                eligible = np.setdiff1d(
+                    np.arange(n_embeddings, dtype=np.int64),
+                    np.fromiter(self._ever_selected_set, dtype=np.int64,
+                                count=len(self._ever_selected_set)),
+                    assume_unique=True,
+                )
+            else:
+                eligible = np.arange(n_embeddings, dtype=np.int64)
+            if len(eligible) >= len(current_set):
+                rng = np.random.default_rng(
+                    (0x85EBCA77 ^ int(self._selection_round)) & 0xFFFFFFFF
+                )
+                rand_pick = set(
+                    rng.choice(eligible, size=len(current_set), replace=False).tolist()
+                )
+                inter_r = len(current_set & rand_pick)
+                union_r = len(current_set | rand_pick)
+                self._selection_jaccard_vs_random = inter_r / max(union_r, 1)
+
         self._prev_selected_set = current_set
         self._selection_history.append(current_set)
         # Account training samples against the global annotation budget.
@@ -2333,6 +2377,9 @@ class ClusterSelector(DataSelector):
 
         # --- Selection overlap metrics ---
         metrics["data_selection/overlap_jaccard"] = self._selection_jaccard
+        metrics["data_selection/overlap_jaccard_vs_random"] = (
+            self._selection_jaccard_vs_random
+        )
         if self._ever_selected_set:
             metrics["data_selection/cumulative_coverage_pct"] = (
                 100.0 * len(self._ever_selected_set) / max(len(self._embeddings), 1)
