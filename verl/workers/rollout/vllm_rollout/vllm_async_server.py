@@ -541,7 +541,12 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        if getattr(self.config, "drop_vision", False):
+            prompt_ids = _strip_vision_tokens(prompt_ids, self.model_config.processor)
+            image_data = None
+            video_data = None
+        else:
+            prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -927,6 +932,34 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+
+def _strip_vision_tokens(prompt_ids: list[int], processor):
+    """Drop all vision-related tokens (image_pad, video_pad, vision_start, vision_end)
+    from the prompt. Used by the `drop_vision` rollout flag for the VDR/leakage audit.
+
+    The model still sees the textual question; it just no longer sees the image span,
+    which would otherwise reference image features that we're not passing through
+    multi_modal_data.
+    """
+    if processor is None:
+        return prompt_ids
+    drop_ids = set()
+    image_token_id = getattr(processor, "image_token_id", None)
+    video_token_id = getattr(processor, "video_token_id", None)
+    if image_token_id is not None:
+        drop_ids.add(int(image_token_id))
+    if video_token_id is not None:
+        drop_ids.add(int(video_token_id))
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        for tok in ("<|vision_start|>", "<|vision_end|>", "<|video_start|>", "<|video_end|>"):
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                drop_ids.add(tid)
+    if not drop_ids:
+        return prompt_ids
+    return [t for t in prompt_ids if int(t) not in drop_ids]
 
 
 def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):

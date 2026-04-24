@@ -230,6 +230,8 @@ class RolloutConfig(BaseConfig):
 
     limit_images: Optional[int] = None
 
+    drop_vision: bool = False
+
     skip_tokenizer_init: bool = False
 
     quantization: Optional[str] = None
