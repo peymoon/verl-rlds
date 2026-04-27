@@ -118,6 +118,17 @@ class ClusterSelectorConfig:
     asymmetric_dead_zone_low: float = 0.05
     asymmetric_dead_zone_high: float = 0.95
 
+    # --- Observed dead-zone (leakage suppression) ---
+    # When observed_deadzone_high < 1.0, samples whose *observed* mean reward
+    # (from the rollout-history buffer) exceeds this threshold are zeroed out of
+    # the utility score.  Unlike asymmetric_dead_zone_high, which uses the
+    # KNN-predicted mean (loo R² < 0, unreliable), this uses actual rollout
+    # outcomes and therefore reliably suppresses saturated and text-leaky samples.
+    # Samples not yet in the rollout buffer default to 0.5 (neutral, not killed).
+    # Recommended value: 0.80 (matches the text-leaky threshold from the 2K audit).
+    # Set to 1.0 (default) to disable.
+    observed_deadzone_high: float = 1.0
+
     # --- Image Grounding Score (IGS) ---
     # Measures multimodal dependency: ratio of reward variance WITH image to
     # variance WITHOUT image.  High IGS means the image is essential for
@@ -1349,6 +1360,28 @@ class ClusterSelector(DataSelector):
 
         return results
 
+    def _get_observed_mean_array(self, size: int) -> Optional[np.ndarray]:
+        """Per-NPZ-index time-weighted observed mean reward, shape (size,).
+
+        Used by the observed dead-zone to kill saturated/text-leaky samples using
+        actual rollout outcomes rather than the KNN-predicted mean (which has
+        loo R² < 0 and therefore cannot reliably identify the high-mean tail).
+
+        Returns None when the rollout buffer is empty (e.g. round 0 before any
+        training rollouts are recorded).  Indices not present in the buffer
+        receive 0.5 (neutral — they are neither killed nor boosted).
+        """
+        if not self._rollout_buffer:
+            return None
+        obs = self._compute_time_weighted_mean_rewards(self._current_training_step)
+        if not obs:
+            return None
+        arr = np.full(size, 0.5, dtype=np.float32)
+        for npz_idx, mean_r in obs.items():
+            if 0 <= npz_idx < size:
+                arr[npz_idx] = float(mean_r)
+        return arr
+
     # ------------------------------------------------------------------
     # Observation rows for predictor
     # ------------------------------------------------------------------
@@ -1916,6 +1949,25 @@ class ClusterSelector(DataSelector):
         else:
             score = variances
 
+        # Observed dead-zone: kill saturated/text-leaky pool entries by observed R_with.
+        # Applied after the asymmetric utility score so it acts as a final filter.
+        obs_high = float(self.cluster_config.observed_deadzone_high)
+        if obs_high < 1.0:
+            obs_means_full = self._get_observed_mean_array(
+                int(pool_arr.max()) + 1 if len(pool_arr) else 0
+            )
+            if obs_means_full is not None:
+                obs_means_pool = obs_means_full[pool_arr]
+                n_before = int((score > 0).sum())
+                score = score.copy()
+                score[obs_means_pool > obs_high] = 0.0
+                n_obs_killed = n_before - int((score > 0).sum())
+                print(
+                    f"[ClusterSelector] frozen reweight observed dead-zone: "
+                    f"high={obs_high:.2f}, killed={n_obs_killed}/{len(pool_arr)} "
+                    f"pool entries with observed R_with > {obs_high:.2f}"
+                )
+
         # Floor: 5% of max score. Prevents starvation so the model revisits
         # "mastered" samples occasionally (they might become informative again
         # after further policy updates).
@@ -2090,6 +2142,22 @@ class ClusterSelector(DataSelector):
                       "falling back to predicted_var")
             else:
                 predicted_var = utility
+
+        # --- Observed dead-zone: kill saturated/text-leaky samples by observed R_with ---
+        obs_high = float(self.cluster_config.observed_deadzone_high)
+        if obs_high < 1.0:
+            obs_means = self._get_observed_mean_array(len(predicted_var))
+            if obs_means is not None:
+                predicted_var = predicted_var.copy()
+                n_before = int((predicted_var > 0).sum())
+                predicted_var[obs_means > obs_high] = 0.0
+                n_obs_killed = n_before - int((predicted_var > 0).sum())
+                n_buffer = int((obs_means != 0.5).sum())
+                print(
+                    f"[ClusterSelector] observed dead-zone: high={obs_high:.2f}, "
+                    f"buffer_size={n_buffer}, killed={n_obs_killed} "
+                    f"(observed R_with > {obs_high:.2f})"
+                )
 
         # --- Exclude already-selected samples ---
         # Without this, top-K selection keeps re-picking the same high-variance

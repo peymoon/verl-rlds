@@ -246,6 +246,12 @@ data_selection:
     asymmetric_dead_zone_low: 0.05
     asymmetric_dead_zone_high: 0.95
 
+    # --- Observed dead-zone (leakage suppression) ---
+    # Samples whose buffered observed R_with mean exceeds this threshold are
+    # zeroed out of the utility score.  Uses actual rollout outcomes rather than
+    # the unreliable KNN-predicted mean.  1.0 = disabled.  0.80 recommended.
+    observed_deadzone_high: 1.0
+
     # Path to the JSON/JSONL used to build the cluster embeddings (e.g.
     # VLAA-Thinking-GRPO-25K_train_90_100.json).  REQUIRED when the NPZ was
     # built from this file and the training parquet has a different row ordering

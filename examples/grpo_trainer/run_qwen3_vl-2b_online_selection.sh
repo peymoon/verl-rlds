@@ -336,7 +336,7 @@ EXP_NAME="${WANDB_RUN_ID:-v62}_k${K_FINAL:-300}_r${N_REPS:-2}_${REPRESENTATIVE_M
 WANDB_DISPLAY_NAME="${WANDB_EXPERIMENT_NAME:-${EXP_NAME}}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"1,3,4,5"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet \
@@ -427,9 +427,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="${WANDB_DISPLAY_NAME}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=${SAVE_FREQ:-5} \
+    trainer.save_freq=${SAVE_FREQ:-10} \
     trainer.test_freq=${TEST_FREQ:-3} \
-    trainer.total_epochs=170 \
+    trainer.total_epochs=300 \
     trainer.default_local_dir=/workspace/rl_data_selection/peyman/outputs/checkpoints/online_selection/${WANDB_DISPLAY_NAME} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     trainer.rollout_data_dir=/workspace/rl_data_selection/peyman/outputs/rollouts/online_selection/${WANDB_DISPLAY_NAME} \
