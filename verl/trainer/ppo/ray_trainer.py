@@ -542,6 +542,44 @@ class RayPPOTrainer:
 
         return metrics
 
+    def _selection_reward_values(self, reward_tensor, reward_extra_infos_dict: Optional[dict]) -> np.ndarray:
+        """Return the scalar reward stream used by the data selector.
+
+        PPO/GRPO still optimizes ``reward_tensor``.  The selector may instead
+        use an unshaped metric such as ``acc`` when reward functions expose it
+        through reward_extra_info.
+        """
+        rewards = reward_tensor.sum(dim=-1).detach().cpu().numpy().astype(np.float32)
+
+        selector = getattr(self, "data_selector", None)
+        cluster_cfg = getattr(selector, "cluster_config", None)
+        key = str(getattr(cluster_cfg, "selection_reward_key", "reward") or "reward")
+
+        if not reward_extra_infos_dict or key in {"reward", "reward_tensor"}:
+            return rewards
+
+        if key in reward_extra_infos_dict:
+            values = np.asarray(reward_extra_infos_dict[key], dtype=np.float32)
+            if values.shape[0] == rewards.shape[0]:
+                return values
+            if not getattr(self, "_warned_selection_reward_shape", False):
+                print(
+                    f"[DataSelection] WARNING: selection_reward_key='{key}' has "
+                    f"length {values.shape[0]} but reward batch has {rewards.shape[0]}; "
+                    "falling back to PPO reward_tensor."
+                )
+                self._warned_selection_reward_shape = True
+            return rewards
+
+        if key != "score" and not getattr(self, "_warned_selection_reward_key", False):
+            available = sorted(reward_extra_infos_dict.keys())
+            print(
+                f"[DataSelection] WARNING: selection_reward_key='{key}' not found "
+                f"in reward_extra_info keys {available}; falling back to PPO reward_tensor."
+            )
+            self._warned_selection_reward_key = True
+        return rewards
+
     def _run_reference_rollouts(self, ref_indices: list) -> np.ndarray:
         """Roll out the current policy on reference samples and collect rewards.
 
@@ -599,12 +637,19 @@ class RayPPOTrainer:
                 batch_reward = self._compute_reward_colocate(batch)
                 batch = batch.union(batch_reward)
 
-            reward_tensor, _ = extract_reward(batch)
-            rewards_per_sample = reward_tensor.sum(dim=-1).cpu().numpy()
+            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+            rewards_per_sample = self._selection_reward_values(
+                reward_tensor,
+                reward_extra_infos_dict,
+            )
 
             uids = batch.non_tensor_batch["uid"]
-            unique_uids = np.unique(uids)
-            for uid in unique_uids:
+            seen_uids = set()
+            for uid in uids:
+                uid = str(uid)
+                if uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
                 uid_mask = uids == uid
                 uid_rewards = rewards_per_sample[uid_mask]
                 all_rewards.append(uid_rewards)
@@ -1722,7 +1767,10 @@ class RayPPOTrainer:
                             self.data_selector.update_rollout_history(
                                 step=self.global_steps,
                                 uids=batch.non_tensor_batch["uid"],
-                                rewards_per_rollout=reward_tensor.sum(dim=-1).cpu().numpy(),
+                                rewards_per_rollout=self._selection_reward_values(
+                                    reward_tensor,
+                                    reward_extra_infos_dict,
+                                ),
                                 dataset_indices=batch.non_tensor_batch.get("dataset_idx"),
                             )
 

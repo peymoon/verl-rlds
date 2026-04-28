@@ -204,6 +204,11 @@ class ClusterSelectorConfig:
     # "maximally uncertain given the observed mean reward."
     normalize_variance: bool = True
 
+    # Reward-extra field used by the selector for reference/training rollout
+    # labels. Keep PPO/GRPO's shaped reward in "score", but use true task
+    # accuracy/IoU ("acc") for normalized variance and dead-zone logic.
+    selection_reward_key: str = "acc"
+
     # --- Medoid budget accounting ---
     # When False (default), medoid/representative rollouts do NOT count
     # against the global_budget_pct cap — only training and exploration
@@ -280,6 +285,7 @@ class ClusterSelector(DataSelector):
         self._cluster_mean_rewards: Dict[int, float] = {}
         self._rep_variances: Dict[int, float] = {}  # global_idx -> individual rollout variance
         self._rep_mean_rewards: Dict[int, float] = {}  # global_idx -> individual rollout mean reward
+        self._rep_reward_rows: Dict[int, np.ndarray] = {}  # global_idx -> raw rollout rewards
         self._last_selected_indices: List[int] = []
         self._selection_round: int = 0  # incremented each call to select()
 
@@ -365,6 +371,12 @@ class ClusterSelector(DataSelector):
     # Budget schedule helpers
     # ------------------------------------------------------------------
 
+    def _budget_counted_set(self) -> set:
+        """NPZ indices that count against the global selection budget."""
+        if self.cluster_config.count_medoids_in_budget:
+            return set(self._ever_selected_set)
+        return set(self._ever_selected_train) | set(self._ever_selected_exploration)
+
     def _get_current_phase(self):
         """Return (per_round_pct, interval) for the active budget phase.
 
@@ -375,12 +387,8 @@ class ClusterSelector(DataSelector):
         if not schedule:
             return (self.config.selection_budget_pct, self.config.reselect_interval)
 
-        # Compute current budget utilisation (training + exploration only)
-        if self.cluster_config.count_medoids_in_budget:
-            n_used = len(getattr(self, "_ever_selected_set", set()))
-        else:
-            n_used = (len(getattr(self, "_ever_selected_train", set()))
-                      + len(getattr(self, "_ever_selected_exploration", set())))
+        # Compute current budget utilisation.
+        n_used = len(self._budget_counted_set())
 
         # Global max from config
         n_embeddings = len(self._embeddings) if self._embeddings is not None else self._dataset_size
@@ -457,6 +465,7 @@ class ClusterSelector(DataSelector):
             "_cluster_mean_rewards": dict(self._cluster_mean_rewards),
             "_rep_variances": dict(self._rep_variances),
             "_rep_mean_rewards": dict(self._rep_mean_rewards),
+            "_rep_reward_rows": dict(self._rep_reward_rows),
             # Selection tracking
             "_selection_round": self._selection_round,
             "_current_training_step": self._current_training_step,
@@ -491,6 +500,7 @@ class ClusterSelector(DataSelector):
         self._cluster_mean_rewards = state["_cluster_mean_rewards"]
         self._rep_variances = state["_rep_variances"]
         self._rep_mean_rewards = state["_rep_mean_rewards"]
+        self._rep_reward_rows = state.get("_rep_reward_rows", {})
 
         self._selection_round = state["_selection_round"]
         self._current_training_step = state["_current_training_step"]
@@ -1116,6 +1126,7 @@ class ClusterSelector(DataSelector):
 
         self._rep_variances = {}
         self._rep_mean_rewards = {}
+        self._rep_reward_rows = {}
         medoid_npz_used: List[int] = []
         for i, parquet_ref_idx in enumerate(ref_indices):
             global_idx = to_npz(parquet_ref_idx)  # NPZ position
@@ -1133,6 +1144,7 @@ class ClusterSelector(DataSelector):
                 var_r = min(var_r / denom, 1.0)
             self._rep_variances[global_idx] = var_r  # individual variance per rep
             self._rep_mean_rewards[global_idx] = mean_r  # individual mean reward per rep
+            self._rep_reward_rows[global_idx] = ref_rewards[i].copy()
             cluster_rewards[c_id].append(var_r)
             cluster_all_rewards[c_id].append(mean_r)
             medoid_npz_used.append(int(global_idx))
@@ -1146,13 +1158,12 @@ class ClusterSelector(DataSelector):
                     (self._current_training_step, ref_rewards[i].copy())
                 )
 
-        # Account medoid rollouts against the global annotation budget.
-        # These samples consumed ground-truth reward computation and should
-        # count toward global_budget_pct just like training samples do.
+        # Track medoid rollouts separately from training/exploration budget.
+        # They count only when count_medoids_in_budget=True.
         if medoid_npz_used:
-            new_medoid = set(medoid_npz_used) - self._ever_selected_set
+            new_medoid = set(medoid_npz_used) - self._ever_selected_medoid
             self._ever_selected_medoid |= new_medoid
-            self._ever_selected_set |= new_medoid
+            self._ever_selected_set |= set(medoid_npz_used)
 
         self._cluster_variances = {}
         self._cluster_mean_rewards = {}
@@ -1393,8 +1404,8 @@ class ClusterSelector(DataSelector):
         observation event, NOT pre-aggregated.  The predictor decides internally
         how to weight by time and n_rollouts inside its fit() method.
 
-        Also includes REPR medoid rollouts from _rep_variances when the buffer
-        is empty (cold-start fallback).
+        Also includes raw REPR medoid rollout rows when the buffer is empty
+        (cold-start fallback).
         """
         rows: List[Tuple[int, int, np.ndarray]] = []
 
@@ -1403,19 +1414,14 @@ class ClusterSelector(DataSelector):
                 for t, rewards in history:
                     rows.append((int(npz_idx), int(t), rewards))
 
-        # Cold-start: if buffer is empty but we have REPR medoid variances,
-        # synthesize pseudo-observations so the predictor has something to fit.
-        if not rows and self._rep_variances:
+        # Cold-start: if buffer is empty but we have REPR medoid rollouts, use
+        # those exact reward rows. Do not fabricate binary rows from the mean;
+        # doing so changes both the variance scale and the empirical mean.
+        if not rows and self._rep_reward_rows:
             for idx, c_id in zip(self._rep_indices, self._rep_cluster_ids):
-                v = self._rep_variances.get(idx)
-                m = self._rep_mean_rewards.get(idx, 0.5)
-                if v is not None:
-                    # Synthesize a reward array matching the observed mean
-                    n_synth = 8
-                    synth_rewards = np.zeros(n_synth, dtype=np.float32)
-                    n_correct = max(0, min(n_synth, int(round(m * n_synth))))
-                    synth_rewards[:n_correct] = 1.0
-                    rows.append((int(idx), 0, synth_rewards))
+                rewards = self._rep_reward_rows.get(idx)
+                if rewards is not None:
+                    rows.append((int(idx), 0, np.asarray(rewards, dtype=np.float32)))
 
         return rows
 
@@ -1491,6 +1497,7 @@ class ClusterSelector(DataSelector):
             dots_temperature=self.cluster_config.dots_temperature,
             dots_top_k=self.cluster_config.dots_top_k,
             cluster_ids=self._cluster_ids,
+            variance_normalized=self.cluster_config.normalize_variance,
         )
         d = self._last_predictor_diagnostics
         print(f"[ClusterSelector] Predictor diagnostics: "
@@ -1598,9 +1605,9 @@ class ClusterSelector(DataSelector):
 
         # Account exploration rollouts against the global annotation budget.
         if explore_npz_used:
-            new_explore = set(explore_npz_used) - self._ever_selected_set
+            new_explore = set(explore_npz_used) - self._ever_selected_exploration
             self._ever_selected_exploration |= new_explore
-            self._ever_selected_set |= new_explore
+            self._ever_selected_set |= set(explore_npz_used)
 
         print(f"[ClusterSelector] Exploration: added {n_added} samples to history buffer "
               f"({len(explore_npz_used)} new uniques counted against global budget)")
@@ -1687,36 +1694,38 @@ class ClusterSelector(DataSelector):
     def select(self, budget: int) -> List[int]:
         self._selection_round += 1
 
-        if self._selection_frozen:
-            return self._select_frozen_reweight(budget)
-
-        strategy = self.cluster_config.strategy
-
-        # Cold-start fallback: only resort to random when neither the
-        # cluster-level signal NOR the sample-level rollout buffer has any
-        # data yet.  The `interpolated` strategy reads from the rollout
-        # buffer via _fit_predict_cached, so an empty _cluster_variances
-        # alone is NOT a reason to go random — that used to silently
-        # degrade runs where active probes populated the buffer but not
-        # the rep-keyed variance dict.
-        has_cluster_signal = bool(self._cluster_variances)
-        has_sample_signal = bool(self._rollout_buffer) or bool(self._rep_variances)
-        if not has_cluster_signal and not (strategy == "interpolated" and has_sample_signal):
-            print("[ClusterSelector] No variance data yet, selecting random")
-            return self._rng.choice(
-                self._dataset_size, size=min(budget, self._dataset_size), replace=False
-            ).tolist()
-
-        if strategy == "top_clusters":
-            npz_indices = self._select_top_clusters(budget)
-        elif strategy == "weighted":
-            npz_indices = self._select_weighted(budget)
-        elif strategy == "scored":
-            npz_indices = self._select_scored(budget)
-        elif strategy == "interpolated":
-            npz_indices = self._select_interpolated(budget)
+        was_frozen = self._selection_frozen
+        if was_frozen:
+            strategy = "frozen_reweight"
+            npz_indices = self._select_frozen_reweight(budget)
         else:
-            raise ValueError(f"Unknown cluster selection strategy: {strategy}")
+            strategy = self.cluster_config.strategy
+
+            # Cold-start fallback: only resort to random when neither the
+            # cluster-level signal NOR the sample-level rollout buffer has any
+            # data yet.  The `interpolated` strategy reads from the rollout
+            # buffer via _fit_predict_cached, so an empty _cluster_variances
+            # alone is NOT a reason to go random — that used to silently
+            # degrade runs where active probes populated the buffer but not
+            # the rep-keyed variance dict.
+            has_cluster_signal = bool(self._cluster_variances)
+            has_sample_signal = bool(self._rollout_buffer) or bool(self._rep_reward_rows)
+            if not has_cluster_signal and not (strategy == "interpolated" and has_sample_signal):
+                print("[ClusterSelector] No variance data yet, selecting random")
+                return self._rng.choice(
+                    self._dataset_size, size=min(budget, self._dataset_size), replace=False
+                ).tolist()
+
+            if strategy == "top_clusters":
+                npz_indices = self._select_top_clusters(budget)
+            elif strategy == "weighted":
+                npz_indices = self._select_weighted(budget)
+            elif strategy == "scored":
+                npz_indices = self._select_scored(budget)
+            elif strategy == "interpolated":
+                npz_indices = self._select_interpolated(budget)
+            else:
+                raise ValueError(f"Unknown cluster selection strategy: {strategy}")
 
         # --- Selection overlap tracking ---
         current_set = set(npz_indices)
@@ -1736,16 +1745,15 @@ class ClusterSelector(DataSelector):
         self._selection_jaccard_vs_random = 0.0
         if len(current_set) > 0:
             n_embeddings = len(self._embeddings)
-            # At this point in the flow, `_ever_selected_set` has NOT yet been
-            # updated with current_set — that update happens below, after the
-            # overlap block. So `_ever_selected_set` here is exactly the pool
-            # of samples the selector was excluding from discovery this round.
-            if (getattr(self.cluster_config, "exclude_already_selected", True)
-                    and self._ever_selected_set):
+            if was_frozen:
+                pool = self._frozen_pool_npz or sorted(self._budget_counted_set())
+                eligible = np.asarray(pool, dtype=np.int64)
+            elif (getattr(self.cluster_config, "exclude_already_selected", True)
+                    and self._discovery_exclude_set()):
+                exclude = self._discovery_exclude_set()
                 eligible = np.setdiff1d(
                     np.arange(n_embeddings, dtype=np.int64),
-                    np.fromiter(self._ever_selected_set, dtype=np.int64,
-                                count=len(self._ever_selected_set)),
+                    np.fromiter(exclude, dtype=np.int64, count=len(exclude)),
                     assume_unique=True,
                 )
             else:
@@ -1764,9 +1772,9 @@ class ClusterSelector(DataSelector):
         self._prev_selected_set = current_set
         self._selection_history.append(current_set)
         # Account training samples against the global annotation budget.
-        new_train = current_set - self._ever_selected_set
+        new_train = current_set - self._ever_selected_train
         self._ever_selected_train |= new_train
-        self._ever_selected_set |= new_train
+        self._ever_selected_set |= current_set
 
         # Track per-cluster selection frequency
         for idx in npz_indices:
@@ -1793,16 +1801,12 @@ class ClusterSelector(DataSelector):
         # When global_budget_pct is set, freeze selection once cumulative unique
         # samples reach the cap.  By default medoid probes are excluded from
         # the count (they're measurement cost, not training data).
-        if self.config.global_budget_pct is not None:
+        if self.config.global_budget_pct is not None and not was_frozen:
             global_max = max(1, int(n_embeddings * self.config.global_budget_pct / 100.0))
-            if self.cluster_config.count_medoids_in_budget:
-                n_budget_used = len(self._ever_selected_set)
-            else:
-                n_budget_used = (len(self._ever_selected_train)
-                                 + len(self._ever_selected_exploration))
+            n_budget_used = len(self._budget_counted_set())
             if n_budget_used >= global_max:
                 self._selection_frozen = True
-                self._frozen_pool_npz = sorted(self._ever_selected_set)
+                self._frozen_pool_npz = sorted(self._budget_counted_set())
                 print(f"[ClusterSelector] Global budget cap reached: "
                       f"{n_budget_used} budget samples >= {global_max} "
                       f"({self.config.global_budget_pct}% of {n_embeddings}, "
@@ -1815,16 +1819,15 @@ class ClusterSelector(DataSelector):
         # selector wants rolled out; the dataloader, however, needs enough
         # rows to form at least one full batch (drop_last=True).  When the
         # budget schedule tapers per_round_pct below train_batch_size, we
-        # backfill with samples the selector has already annotated (i.e.
-        # anything in _ever_selected_set).  These are free — they already
-        # have rollout history and have already been counted against the
-        # global annotation budget — so padding keeps training alive without
-        # inflating the annotation cost.
+        # backfill with samples already counted in the training/exploration
+        # budget. These are free — they already have rollout history and have
+        # already been counted against the global annotation budget — so
+        # padding keeps training alive without inflating the annotation cost.
         floor = int(self._min_training_pool_size)
         if floor > 0 and len(indices) < floor:
             selected_set = set(indices)
             # Previously annotated parquet indices, minus what we already have.
-            pool_npz = self._ever_selected_set - set(npz_indices)
+            pool_npz = self._budget_counted_set() - set(npz_indices)
             pool_parquet: List[int] = []
             if pool_npz:
                 remapped = self._remap_npz_to_dataset(list(pool_npz))
@@ -1900,13 +1903,14 @@ class ClusterSelector(DataSelector):
 
         pool = self._frozen_pool_npz
         if pool is None or len(pool) == 0:
-            pool = sorted(self._ever_selected_set)
+            pool = sorted(self._budget_counted_set()) or sorted(self._ever_selected_set)
         n_pool = len(pool)
 
         if n_pool == 0:
             print("[ClusterSelector] Frozen reweight: empty pool, selecting random")
+            n_embeddings = len(self._embeddings) if self._embeddings is not None else self._dataset_size
             return self._rng.choice(
-                self._dataset_size, size=min(budget, self._dataset_size), replace=False
+                n_embeddings, size=min(budget, n_embeddings), replace=False
             ).tolist()
 
         asym = self.cluster_config.asymmetric_utility_enabled
@@ -1918,23 +1922,21 @@ class ClusterSelector(DataSelector):
         if result is None:
             chosen_npz = list(pool) if n_pool <= budget else \
                 self._rng.choice(pool, size=budget, replace=False).tolist()
-            indices = self._remap_npz_to_dataset(chosen_npz)
-            self._last_selected_indices = indices
             print(f"[ClusterSelector] Frozen reweight round {self._selection_round}: "
-                  f"no variance data yet, uniform {len(indices)} samples")
-            return indices
+                  f"no variance data yet, uniform {len(chosen_npz)} samples")
+            return chosen_npz
 
-        pool_arr = np.array(pool)
+        pool_arr = np.array(pool, dtype=np.int64)
         variances = result.predicted_var[pool_arr]
 
         if variances.sum() == 0:
             chosen_npz = list(pool) if n_pool <= budget else \
                 self._rng.choice(pool, size=budget, replace=False).tolist()
-            indices = self._remap_npz_to_dataset(chosen_npz)
-            self._last_selected_indices = indices
             print(f"[ClusterSelector] Frozen reweight round {self._selection_round}: "
-                  f"all predicted variances zero, uniform {len(indices)} samples")
-            return indices
+                  f"all predicted variances zero, uniform {len(chosen_npz)} samples")
+            return chosen_npz
+
+        dead_mask = np.zeros(n_pool, dtype=bool)
 
         if asym and result.predicted_mean is not None:
             predicted_mean = np.clip(result.predicted_mean[pool_arr], 0.0, 1.0)
@@ -1942,12 +1944,13 @@ class ClusterSelector(DataSelector):
             utility = variances * (1.0 + alpha * (0.5 - predicted_mean))
             low = float(self.cluster_config.asymmetric_dead_zone_low)
             high = float(self.cluster_config.asymmetric_dead_zone_high)
-            utility[predicted_mean < low] = 0.0
-            utility[predicted_mean > high] = 0.0
+            dead_mask |= predicted_mean < low
+            dead_mask |= predicted_mean > high
+            utility[dead_mask] = 0.0
             utility = np.maximum(utility, 0.0).astype(np.float32)
             score = utility
         else:
-            score = variances
+            score = variances.copy()
 
         # Observed dead-zone: kill saturated/text-leaky pool entries by observed R_with.
         # Applied after the asymmetric utility score so it acts as a final filter.
@@ -1960,7 +1963,9 @@ class ClusterSelector(DataSelector):
                 obs_means_pool = obs_means_full[pool_arr]
                 n_before = int((score > 0).sum())
                 score = score.copy()
-                score[obs_means_pool > obs_high] = 0.0
+                obs_dead = obs_means_pool > obs_high
+                dead_mask |= obs_dead
+                score[obs_dead] = 0.0
                 n_obs_killed = n_before - int((score > 0).sum())
                 print(
                     f"[ClusterSelector] frozen reweight observed dead-zone: "
@@ -1968,24 +1973,23 @@ class ClusterSelector(DataSelector):
                     f"pool entries with observed R_with > {obs_high:.2f}"
                 )
 
-        # Floor: 5% of max score. Prevents starvation so the model revisits
-        # "mastered" samples occasionally (they might become informative again
-        # after further policy updates).
-        max_score = float(score.max()) if score.size else 0.0
+        # Floor: 5% of max eligible score. Prevents starvation among eligible
+        # samples while preserving hard dead-zone exclusions.
+        eligible = ~dead_mask
+        if not eligible.any():
+            eligible = np.ones(n_pool, dtype=bool)
+            score = variances.copy()
+        max_score = float(score[eligible].max()) if eligible.any() else 0.0
         if max_score <= 0.0:
-            # Asymmetric mask wiped everything out — fall back to raw variance.
-            score = variances
-            max_score = float(score.max()) if score.size else 0.0
-        floor = max(max_score * 0.05, 1e-8)
-        weights = np.maximum(score, floor)
+            weights = eligible.astype(np.float64)
+        else:
+            floor = max(max_score * 0.05, 1e-8)
+            weights = np.where(eligible, np.maximum(score, floor), 0.0).astype(np.float64)
         weights /= weights.sum()
 
         # Sample with replacement — high-variance samples appear multiple times.
         chosen_positions = self._rng.choice(n_pool, size=budget, replace=True, p=weights)
         chosen_npz = [pool[pos] for pos in chosen_positions]
-
-        indices = self._remap_npz_to_dataset(chosen_npz)
-        self._last_selected_indices = indices
 
         n_unique = len(set(chosen_npz))
         counts = Counter(chosen_npz)
@@ -1995,7 +1999,7 @@ class ClusterSelector(DataSelector):
               f"{n_unique} unique/{budget} total, max_reps={max_reps}, "
               f"predicted_var=[{variances.min():.4f}, {variances.max():.4f}], "
               f"zero_pred={n_zero_pred}/{n_pool}")
-        return indices
+        return chosen_npz
 
     def _select_top_clusters(self, budget: int) -> List[int]:
         """Greedily include all samples from highest-variance clusters."""
@@ -2030,7 +2034,7 @@ class ClusterSelector(DataSelector):
             raw = var / total_var * budget
             allocations[c_id] = min(max(1, int(round(raw))), cluster_size)
 
-        allocations = self._adjust_allocations(allocations, budget)
+        allocations = self._adjust_allocations(allocations, budget, active)
         return self._execute_allocations(allocations)
 
     def _select_scored(self, budget: int) -> List[int]:
@@ -2063,7 +2067,7 @@ class ClusterSelector(DataSelector):
             raw = ratio * budget
             allocations[c_id] = min(max(1, int(round(raw))), cluster_size)
 
-        allocations = self._adjust_allocations(allocations, budget)
+        allocations = self._adjust_allocations(allocations, budget, active)
 
         top_n = 15
         sorted_by_score = sorted(active.items(), key=lambda x: -x[1])[:top_n]
@@ -2262,7 +2266,7 @@ class ClusterSelector(DataSelector):
             cluster_size = int((self._cluster_ids == c_id).sum())
             allocations[c_id] = min(max(1, int(round(ratio * budget))), cluster_size)
 
-        allocations = self._adjust_allocations(allocations, budget)
+        allocations = self._adjust_allocations(allocations, budget, cluster_scores)
 
         # Step 5: within each cluster take top-n by predicted variance.
         selected = []
@@ -2383,12 +2387,18 @@ class ClusterSelector(DataSelector):
         global_selected = cluster_indices[local_indices[np.array(selected_local)]]
         return global_selected.tolist()
 
-    def _adjust_allocations(self, allocations: Dict[int, int], budget: int) -> Dict[int, int]:
+    def _adjust_allocations(
+        self,
+        allocations: Dict[int, int],
+        budget: int,
+        score_lookup: Optional[Dict[int, float]] = None,
+    ) -> Dict[int, int]:
         """Adjust allocations to match budget exactly."""
+        score_lookup = score_lookup or self._cluster_variances
         total = sum(allocations.values())
         if total > budget:
             sorted_keys = sorted(allocations.keys(),
-                                 key=lambda c: self._cluster_variances.get(c, 0))
+                                 key=lambda c: score_lookup.get(c, 0))
             for c_id in sorted_keys:
                 if total <= budget:
                     break
@@ -2398,7 +2408,7 @@ class ClusterSelector(DataSelector):
                     total -= reduction
         elif total < budget:
             sorted_keys = sorted(allocations.keys(),
-                                 key=lambda c: self._cluster_variances.get(c, 0),
+                                 key=lambda c: score_lookup.get(c, 0),
                                  reverse=True)
             for c_id in sorted_keys:
                 if total >= budget:
@@ -2455,11 +2465,9 @@ class ClusterSelector(DataSelector):
             metrics["data_selection/cumulative_unique_selected"] = float(len(self._ever_selected_set))
             metrics["data_selection/selection_round"] = float(self._selection_round)
 
-            # Per-source budget breakdown — every sample where the trainer
-            # consumed ground truth is bucketed by *why* it was annotated.
-            # The three sets are maintained as disjoint (each new sample is
-            # added to exactly one source bucket on first observation), so
-            # they sum to cumulative_unique_selected.
+            # Per-source budget breakdown. A sample can be both a medoid probe
+            # and a later training sample; the training/exploration union is
+            # what counts when medoids are excluded from the budget.
             metrics["data_selection/budget_breakdown/training"] = float(
                 len(self._ever_selected_train))
             metrics["data_selection/budget_breakdown/medoid"] = float(
@@ -2478,11 +2486,7 @@ class ClusterSelector(DataSelector):
             if self.config.global_budget_pct is not None:
                 global_max = max(1, int(len(self._embeddings) * self.config.global_budget_pct / 100.0))
                 metrics["data_selection/global_budget"] = float(global_max)
-                if self.cluster_config.count_medoids_in_budget:
-                    n_budget_used = len(self._ever_selected_set)
-                else:
-                    n_budget_used = (len(self._ever_selected_train)
-                                     + len(self._ever_selected_exploration))
+                n_budget_used = len(self._budget_counted_set())
                 metrics["data_selection/global_budget_utilization_pct"] = (
                     100.0 * n_budget_used / global_max
                 )
@@ -2496,13 +2500,14 @@ class ClusterSelector(DataSelector):
                 # Reweight stats: predicted variance within the frozen pool
                 if (self._selection_frozen
                         and self._last_predicted_var is not None):
-                    pool = self._frozen_pool_npz or sorted(self._ever_selected_set)
+                    pool = self._frozen_pool_npz or sorted(self._budget_counted_set())
                     pool_arr = np.array(pool)
-                    pv = self._last_predicted_var[pool_arr]
-                    metrics["data_selection/frozen_pool_var_mean"] = float(pv.mean())
-                    metrics["data_selection/frozen_pool_var_max"] = float(pv.max())
-                    metrics["data_selection/frozen_pool_n_zero_var"] = float(
-                        np.sum(pv < 1e-8))
+                    if len(pool_arr) > 0:
+                        pv = self._last_predicted_var[pool_arr]
+                        metrics["data_selection/frozen_pool_var_mean"] = float(pv.mean())
+                        metrics["data_selection/frozen_pool_var_max"] = float(pv.max())
+                        metrics["data_selection/frozen_pool_n_zero_var"] = float(
+                            np.sum(pv < 1e-8))
 
         # Per-cluster selection frequency stats (how evenly distributed is selection?)
         if self._per_cluster_coverage:

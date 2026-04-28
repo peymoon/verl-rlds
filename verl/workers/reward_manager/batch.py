@@ -93,6 +93,7 @@ class BatchRewardManager(AbstractRewardManager):
 
         scores = self.verify(data)
         rewards = []
+        acc_values = []
         already_printed: dict[str, Any] = {}
 
         for i in range(len(data)):
@@ -101,12 +102,15 @@ class BatchRewardManager(AbstractRewardManager):
 
             if isinstance(score, dict):
                 reward = score["score"]
+                acc = score.get("acc", reward)
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+                acc = reward
 
             rewards.append(reward)
+            acc_values.append(acc)
             reward_tensor[i, length - 1] = reward
 
             data_source = data_sources[i]
@@ -120,7 +124,7 @@ class BatchRewardManager(AbstractRewardManager):
                 print("[score]", scores[i])
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
-        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+        data.batch["acc"] = torch.tensor(acc_values, dtype=torch.float32, device=prompt_ids.device)
 
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}

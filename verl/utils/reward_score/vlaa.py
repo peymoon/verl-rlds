@@ -129,7 +129,8 @@ def compute_score(
     ground_truth: str,
     extra_info: dict | None = None,
     format_score: float = 0.1,
-) -> float:
+    **kwargs,
+) -> dict:
     """Compute the VLAA reward score.
 
     Args:
@@ -139,7 +140,8 @@ def compute_score(
         format_score:  Weight assigned to the format component (default 0.1).
 
     Returns:
-        Scalar reward in [0, 1].
+        Dict with the PPO reward under ``score`` and the unshaped task
+        accuracy/IoU under ``acc`` for metrics and data selection.
     """
     verifier_type = (extra_info or {}).get("verifier_type", "math")
     fmt = _format_reward(predict_str)
@@ -155,4 +157,8 @@ def compute_score(
         # Unknown type: fall back to math grader
         acc = _math_acc(predict_str, ground_truth)
 
-    return (1.0 - format_score) * acc + format_score * fmt
+    return {
+        "score": (1.0 - format_score) * acc + format_score * fmt,
+        "acc": acc,
+        "format": fmt,
+    }

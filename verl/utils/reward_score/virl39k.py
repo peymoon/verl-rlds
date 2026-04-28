@@ -84,12 +84,17 @@ def compute_score(
     ground_truth: str,
     extra_info: dict | None = None,
     format_score: float = 0.1,
-) -> float:
+    **kwargs,
+) -> dict:
     fmt = _format_reward(predict_str)
 
     pred = _extract_pred(predict_str)
     if not pred:
-        return format_score * fmt
+        return {
+            "score": format_score * fmt,
+            "acc": 0.0,
+            "format": fmt,
+        }
 
     gt = _strip_boxed(ground_truth)
 
@@ -102,4 +107,8 @@ def compute_score(
     else:
         acc = 0.0
 
-    return (1.0 - format_score) * acc + format_score * fmt
+    return {
+        "score": (1.0 - format_score) * acc + format_score * fmt,
+        "acc": acc,
+        "format": fmt,
+    }

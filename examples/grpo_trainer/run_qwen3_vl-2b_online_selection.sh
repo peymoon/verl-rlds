@@ -133,7 +133,7 @@ Common env vars:
     DENSITY_DIVERSE_K, DENSITY_DIVERSE_ALPHA, DENSITY_DIVERSE_BETA, DENSITY_DIVERSE_RADIUS,
     EXPLORATION_ENABLED, EXPLORATION_PCT, EXPLORATION_INTERVAL, EXPLORATION_PCT_BASE,
     ASYMMETRIC_UTILITY, ASYMMETRIC_BIAS, ASYMMETRIC_DEAD_LOW, ASYMMETRIC_DEAD_HIGH,
-    ROLLOUT_HISTORY_MAX_REFS, NORMALIZE_VARIANCE, COUNT_MEDOIDS_IN_BUDGET,
+    ROLLOUT_HISTORY_MAX_REFS, NORMALIZE_VARIANCE, SELECTION_REWARD_KEY, COUNT_MEDOIDS_IN_BUDGET,
     BUDGET_SCHEDULE, CUDA_VISIBLE_DEVICES,
     PREDICTOR_TYPE, PREDICTOR_ALPHA,
     PREDICTOR_MLP_HIDDEN, PREDICTOR_MLP_LR, PREDICTOR_MLP_STEPS, PREDICTOR_MLP_WEIGHT_DECAY,
@@ -272,6 +272,7 @@ ROLLOUT_HISTORY_MAX_REFS=${ROLLOUT_HISTORY_MAX_REFS:-0}
 # (math/mcq/digit) and continuous-reward tasks (IoU grounding) are scored
 # on a comparable [0,1] scale.
 NORMALIZE_VARIANCE=${NORMALIZE_VARIANCE:-true}
+SELECTION_REWARD_KEY=${SELECTION_REWARD_KEY:-acc}
 
 # --- Medoid budget accounting ---
 # When false, medoid probe rollouts do NOT count against global_budget_pct.
@@ -385,6 +386,7 @@ python3 -m verl.trainer.main_ppo \
     data_selection.cluster.asymmetric_dead_zone_low=$ASYMMETRIC_DEAD_LOW \
     data_selection.cluster.asymmetric_dead_zone_high=$ASYMMETRIC_DEAD_HIGH \
     +data_selection.cluster.normalize_variance=$NORMALIZE_VARIANCE \
+    +data_selection.cluster.selection_reward_key=$SELECTION_REWARD_KEY \
     +data_selection.cluster.count_medoids_in_budget=$COUNT_MEDOIDS_IN_BUDGET \
     +data_selection.cluster.predictor_type=$PREDICTOR_TYPE \
     +data_selection.cluster.predictor_alpha=$PREDICTOR_ALPHA \

@@ -96,6 +96,7 @@ class NaiveRewardManager(AbstractRewardManager):
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+                reward_extra_info["acc"].append(reward)
 
             reward_tensor[i, valid_response_length - 1] = reward
 

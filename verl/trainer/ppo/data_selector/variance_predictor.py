@@ -85,6 +85,7 @@ def compute_predictor_diagnostics(
     dots_temperature: float = 0.05,
     dots_top_k: int = 64,
     cluster_ids: Optional[np.ndarray] = None,
+    variance_normalized: bool = True,
 ) -> Dict[str, float]:
     """Compute LOO-KNN R², Spearman rho, and MAE for the current predictor.
 
@@ -138,12 +139,12 @@ def compute_predictor_diagnostics(
         metrics["data_selection/predictor_mean_train_r2"] = r2_mean
 
         # --- Fair variance R² against the empirical-mean-implied variance ---
-        # Ridge/MLP predict v̂ = p̂(1−p̂). Comparing that against the empirical
-        # 8-rollout sample variance (which is a noisy estimator of p(1−p))
-        # penalises them for the noise in the label. The apples-to-apples
-        # target is p_emp*(1−p_emp): if the model's p̂ is perfect, v̂ matches
-        # this target exactly, and any residual is the model's fault.
+        # Keep the target on the same scale as the selector's variance label:
+        # raw p_emp*(1-p_emp), or normalized max-variance indicator when the
+        # selector normalizes by p*(1-p).
         obs_var_implied = obs_mean * (1.0 - obs_mean)
+        if variance_normalized:
+            obs_var_implied = np.where(obs_var_implied > 1e-8, 1.0, 0.0)
         ss_tot_vi = float(np.sum((obs_var_implied - obs_var_implied.mean()) ** 2))
         ss_res_vi = float(np.sum((pred_at_refs - obs_var_implied) ** 2))
         r2_v_implied = 1.0 - ss_res_vi / max(ss_tot_vi, 1e-12)
@@ -151,6 +152,7 @@ def compute_predictor_diagnostics(
         metrics["data_selection/predictor_train_mae_vs_pmean_var"] = float(
             np.mean(np.abs(pred_at_refs - obs_var_implied))
         )
+        metrics["data_selection/predictor_pmean_var_target_normalized"] = float(variance_normalized)
 
     # --- LOO-KNN R² (embedding ceiling) ---
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
