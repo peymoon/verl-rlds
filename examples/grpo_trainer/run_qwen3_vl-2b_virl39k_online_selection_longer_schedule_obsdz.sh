@@ -22,7 +22,7 @@
 #   (C) HURT: drop §3.6 from headline; report only as corpus-characterisation result.
 #
 # Required prerequisite:
-#   cd /workspace/rl_data_selection/benchmark/rl_data_selection
+#   cd /workspace/rl_data_selection
 #   bash dataset_prep/prepare.sh virl39k
 #
 # Usage:
@@ -36,13 +36,13 @@ DATASET_NAME="virl39k"
 K_FINAL="${K_FINAL:-150}"
 N_REPS="${N_REPS:-3}"
 export WANDB_API_KEY='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'
-TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100_stratified_seed1234}"
-TEST_SPLIT="${TEST_SPLIT:-test_10_100_stratified_seed1234}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100}"
+TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
 
 DS_ROOT="${DATA_ROOT}/${DATASET_NAME}"
 TRAIN_PARQUET="${DS_ROOT}/parquet/${TRAIN_SPLIT}.parquet"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
-CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-${DS_ROOT}/cluster_arrays/${TRAIN_SPLIT}/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz}"
+CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-${DS_ROOT}/cluster_arrays_90_100/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz}"
 DATASET_JSON="${DATASET_JSON:-${DS_ROOT}/records/${TRAIN_SPLIT}.jsonl}"
 
 for p in "$TRAIN_PARQUET" "$VAL_PARQUET" "$CLUSTER_ARRAYS" "$DATASET_JSON"; do

@@ -83,7 +83,7 @@ set -x
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash run_qwen3_vl-2b_online_selection.sh
 #
 #   # Fair comparison with random 10% (freeze after first smart selection):
-#   GLOBAL_BUDGET_PCT=10.0 bash run_qwen3_vl-2b_online_selection.sh
+#   GLOBAL_BUDGET_PCT=11.11 bash run_qwen3_vl-2b_online_selection.sh
 #
 #   # Pass extra Hydra overrides (appended after all positional params):
 #   bash run_qwen3_vl-2b_online_selection.sh vllm /path/cluster.npz interpolated_weighted /path/dataset.json \
@@ -98,7 +98,7 @@ Usage:
 Positional args:
     ENGINE          vllm | sglang (default: vllm)
     CLUSTER_ARRAYS  path to cluster_arrays.npz
-                                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz)
+                                    (default: /workspace/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz)
     VARIANT         interpolated_weighted | interpolated (default: interpolated_weighted)
     DATASET_JSON    JSON/JSONL used to build cluster embeddings (required for NPZ↔parquet remap)
                                     (default: /workspace/rl_data_selection/data/VLAA-Thinking/VLAA-Thinking-GRPO-25K_train_90_100.json)
@@ -139,7 +139,7 @@ Common env vars:
 Examples:
     bash run_qwen3_vl-2b_online_selection.sh
     bash run_qwen3_vl-2b_online_selection.sh --help
-    GLOBAL_BUDGET_PCT=10.0 bash run_qwen3_vl-2b_online_selection.sh
+    GLOBAL_BUDGET_PCT=11.11 bash run_qwen3_vl-2b_online_selection.sh
     bash run_qwen3_vl-2b_online_selection.sh vllm /path/cluster_arrays.npz interpolated /path/dataset.json \
             data_selection.cluster.within_cluster_method=mmd \
             data_selection.cluster.n_reps=4
@@ -152,7 +152,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 fi
 
 ENGINE=${1:-vllm}
-CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz}
+CLUSTER_ARRAYS=${2:-/workspace/rl_data_selection/cluster_selection/outputs_300_cluster_new/cluster_arrays.npz}
 VARIANT=${3:-interpolated_weighted}
 # Path to the JSON/JSONL that was used to build the cluster embeddings.
 # Required to correctly align NPZ row order with parquet row order — these
@@ -210,7 +210,7 @@ fi
 # reweight inside the frozen pool using DOTS-predicted variance (and mean,
 # when asymmetric utility is on).  Set equal to (per-round budget × n_rounds)
 # for a fair comparison against a fixed random baseline at the same %.
-GLOBAL_BUDGET_PCT=${GLOBAL_BUDGET_PCT:-10.0}
+GLOBAL_BUDGET_PCT=${GLOBAL_BUDGET_PCT:-11.11}
 
 # --- Reroll medoids each round? ---
 # When false, the medoid reference rollouts run only on round 0 (cold start),
@@ -225,12 +225,12 @@ REROLL_MEDOIDS=${REROLL_MEDOIDS:-false}
 # exclude_already_selected mask in v3, this is the literal new-unique increment).
 # RESELECT_INTERVAL = how many training steps between reselections.
 # At batch_size=128 the natural unit is one batch.  Defaults below: pick one
-# fresh batch every step until the global cap is hit (~17 rounds for 10% of
-# 22k = 2.2k unique samples), then frozen reweight takes over for the rest of
+# fresh batch every step until the global cap is hit (~20 rounds for 11.11% of
+# 22k = 2.5k unique samples), then frozen reweight takes over for the rest of
 # training.
 SELECTION_BUDGET_PCT=${SELECTION_BUDGET_PCT:-0.58}   # ~128 samples on 22k dataset
 # Reselect every 4 training steps — every-step proved too aggressive: it
-# burns the global cap in ~17 steps (with budget 0.58% × 17 ≈ 10%) which
+# burns the global cap quickly (with budget 0.58% × 19 ≈ 11%) which
 # leaves the bulk of training in the frozen-reweight phase. Stretching the
 # discovery cadence to every 4 steps gives the policy time to actually
 # learn from the new samples before adding more, while the rollout-history
@@ -301,7 +301,7 @@ fi
 EXP_NAME="v666_k300_r2_${REPRESENTATIVE_METHOD}perRound${SELECTION_BUDGET_PCT}_global${GLOBAL_BUDGET_PCT}_${EXP_SUFFIX}"
 EXPLORATION_PCT_BASE=${EXPLORATION_PCT_BASE:-representatives}
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"7"} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0"} \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet \

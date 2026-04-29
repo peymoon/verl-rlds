@@ -33,7 +33,7 @@
 #   /workspace/rl_data_selection/data/vlaa_parquet_splits/train_90_100.parquet
 #   /workspace/rl_data_selection/data/vlaa_parquet_splits/test_10_100.parquet
 #   /workspace/rl_data_selection/data/VLAA-Thinking/VLAA-Thinking-GRPO-25K_train_90_100.json
-#   /workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz
+#   /workspace/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz
 #
 # Usage:
 #   bash run_qwen3_vl-2b_vlaa_online_selection_longer_schedule_obsdz.sh
@@ -50,7 +50,7 @@ DATASET_JSON="${DATASET_JSON:-${VLAA_ROOT}/VLAA-Thinking/VLAA-Thinking-GRPO-25K_
 # ----- Cluster artefact (paper §3.2 specifies K=200, n_reps=3 for VLAA) -----
 K_FINAL="${K_FINAL:-200}"
 N_REPS="${N_REPS:-3}"
-CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz}"
+CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-/workspace/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz}"
 
 export WANDB_API_KEY='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'
 
@@ -68,7 +68,7 @@ export BUDGET_SCHEDULE='[{until_budget_pct:50,per_round_pct:1.0,interval:10},{un
 # Fallback values when no phase matches — used only at the very last fragment
 # of the schedule. These are scaled to VLAA (N=22,675).
 export SELECTION_BUDGET_PCT="${SELECTION_BUDGET_PCT:-0.58}"
-export GLOBAL_BUDGET_PCT="${GLOBAL_BUDGET_PCT:-10.0}"
+export GLOBAL_BUDGET_PCT="${GLOBAL_BUDGET_PCT:-11.11}"
 export RESELECT_INTERVAL="${RESELECT_INTERVAL:-10}"
 
 # ----- Predictor -----

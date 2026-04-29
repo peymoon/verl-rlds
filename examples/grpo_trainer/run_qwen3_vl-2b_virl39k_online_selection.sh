@@ -6,22 +6,22 @@
 # artifacts produced by `bash dataset_prep/prepare.sh virl39k`.
 #
 # Required prerequisite:
-#   cd /workspace/rl_data_selection/benchmark/rl_data_selection
+#   cd /workspace/rl_data_selection
 #   bash dataset_prep/prepare.sh virl39k
 #
 # That pipeline writes:
-#   data/virl39k/parquet/train_90_100_stratified_seed1234.parquet
-#   data/virl39k/parquet/test_10_100_stratified_seed1234.parquet
-#   data/virl39k/records/train_90_100_stratified_seed1234.jsonl
-#   data/virl39k/cluster_arrays/train_90_100_stratified_seed1234/outputs_K${K}_r${N_REPS}/cluster_arrays.npz
+#   data/virl39k/parquet/train_90_100.parquet
+#   data/virl39k/parquet/test_10_100.parquet
+#   data/virl39k/records/train_90_100.jsonl
+#   data/virl39k/cluster_arrays_90_100/outputs_K${K}_r${N_REPS}/cluster_arrays.npz
 #
 # Env vars (overridable):
 #   DATA_ROOT        root under which data/virl39k/ lives
-#                    (default: /workspace/rl_data_selection/benchmark/rl_data_selection/data)
-#   K_FINAL          K used when cluster_arrays was built (default: 300)
+#                    (default: /workspace/rl_data_selection/data)
+#   K_FINAL          K used when cluster_arrays was built (default: 150)
 #   N_REPS           n_reps used when cluster_arrays was built (default: 3)
-#   TRAIN_SPLIT      parquet stem to train on (default: train_90_100_stratified_seed1234)
-#   TEST_SPLIT       parquet stem for validation (default: test_10_100_stratified_seed1234)
+#   TRAIN_SPLIT      parquet stem to train on (default: train_90_100)
+#   TEST_SPLIT       parquet stem for validation (default: test_10_100)
 #   PREDICTOR_TYPE   knn | ridge | mlp (default: knn)
 #   SELECTION_BUDGET_PCT, GLOBAL_BUDGET_PCT, BUDGET_SCHEDULE  — forwarded through
 #   CUDA_VISIBLE_DEVICES — as usual
@@ -41,13 +41,13 @@ DATASET_NAME="virl39k"
 K_FINAL="${K_FINAL:-150}"
 N_REPS="${N_REPS:-3}"
 export WANDB_API_KEY='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'
-TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100_stratified_seed1234}"
-TEST_SPLIT="${TEST_SPLIT:-test_10_100_stratified_seed1234}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100}"
+TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
 
 DS_ROOT="${DATA_ROOT}/${DATASET_NAME}"
 TRAIN_PARQUET="${DS_ROOT}/parquet/${TRAIN_SPLIT}.parquet"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
-CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-${DS_ROOT}/cluster_arrays/${TRAIN_SPLIT}/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz}"
+CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-${DS_ROOT}/cluster_arrays_90_100/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz}"
 DATASET_JSON="${DATASET_JSON:-${DS_ROOT}/records/${TRAIN_SPLIT}.jsonl}"
 
 # Sanity checks — fail fast with an actionable message instead of letting
@@ -72,7 +72,7 @@ export BUDGET_SCHEDULE='[{until_budget_pct:50,per_round_pct:1.0,interval:4},{unt
 # samples) is already > 2 batches (256) and would overshoot the
 # discovery budget by end of round. 0.33% ≈ 128 samples = one batch.
 export SELECTION_BUDGET_PCT="${SELECTION_BUDGET_PCT:-0.33}"
-export GLOBAL_BUDGET_PCT="${GLOBAL_BUDGET_PCT:-10.0}"
+export GLOBAL_BUDGET_PCT="${GLOBAL_BUDGET_PCT:-11.11}"
 export RESELECT_INTERVAL="${RESELECT_INTERVAL:-4}"
 
 export PREDICTOR_TYPE="${PREDICTOR_TYPE:-knn}"

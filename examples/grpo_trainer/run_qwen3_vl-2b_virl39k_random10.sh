@@ -4,7 +4,7 @@
 # same 10% budget.
 #
 # Prereqs:
-#   cd /workspace/rl_data_selection/benchmark/rl_data_selection
+#   cd /workspace/rl_data_selection
 #   bash dataset_prep/prepare.sh virl39k
 #   python -m dataset_prep.make_random_subset --dataset virl39k --subset_pct 10 --seed 42
 #

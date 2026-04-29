@@ -2,11 +2,11 @@
 # Baseline: GRPO on the full ViRL39K 90% train split. No data selection.
 #
 # Prereq:
-#   cd /workspace/rl_data_selection/benchmark/rl_data_selection
+#   cd /workspace/rl_data_selection
 #   bash dataset_prep/prepare.sh virl39k
 #
 # Env vars (overridable):
-#   DATA_ROOT     (default: /workspace/rl_data_selection/benchmark/rl_data_selection/data)
+#   DATA_ROOT     (default: /workspace/rl_data_selection/data)
 #   TRAIN_SPLIT   (default: train_90_100)
 #   TEST_SPLIT    (default: test_10_100)
 #   TOTAL_EPOCHS  (default: 2 — full 39k × 2 ≈ same compute as random10 × 20)

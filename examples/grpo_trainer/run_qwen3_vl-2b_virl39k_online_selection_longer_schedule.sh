@@ -23,7 +23,7 @@
 # story from the cluster-only and immediate-freeze ablations.
 #
 # Required prerequisite:
-#   cd /workspace/rl_data_selection/benchmark/rl_data_selection
+#   cd /workspace/rl_data_selection
 #   bash dataset_prep/prepare.sh virl39k
 #
 # Usage:
@@ -37,13 +37,13 @@ DATASET_NAME="virl39k"
 K_FINAL="${K_FINAL:-150}"
 N_REPS="${N_REPS:-3}"
 export WANDB_API_KEY='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'
-TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100_stratified_seed1234}"
-TEST_SPLIT="${TEST_SPLIT:-test_10_100_stratified_seed1234}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100}"
+TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
 
 DS_ROOT="${DATA_ROOT}/${DATASET_NAME}"
 TRAIN_PARQUET="${DS_ROOT}/parquet/${TRAIN_SPLIT}.parquet"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
-CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-${DS_ROOT}/cluster_arrays/${TRAIN_SPLIT}/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz}"
+CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-${DS_ROOT}/cluster_arrays_90_100/outputs_K${K_FINAL}_r${N_REPS}/cluster_arrays.npz}"
 DATASET_JSON="${DATASET_JSON:-${DS_ROOT}/records/${TRAIN_SPLIT}.jsonl}"
 
 for p in "$TRAIN_PARQUET" "$VAL_PARQUET" "$CLUSTER_ARRAYS" "$DATASET_JSON"; do
@@ -59,7 +59,7 @@ unset BUDGET_SCHEDULE
 export BUDGET_SCHEDULE='[{until_budget_pct:50,per_round_pct:0.7,interval:5},{until_budget_pct:85,per_round_pct:0.25,interval:15},{until_budget_pct:100,per_round_pct:0.10,interval:25}]'
 
 export SELECTION_BUDGET_PCT="${SELECTION_BUDGET_PCT:-0.33}"
-export GLOBAL_BUDGET_PCT="${GLOBAL_BUDGET_PCT:-10.0}"
+export GLOBAL_BUDGET_PCT="${GLOBAL_BUDGET_PCT:-11.11}"
 export RESELECT_INTERVAL="${RESELECT_INTERVAL:-5}"
 
 export PREDICTOR_TYPE="${PREDICTOR_TYPE:-knn}"
