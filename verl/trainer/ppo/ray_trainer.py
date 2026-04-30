@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -57,6 +58,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -310,6 +312,7 @@ class RayPPOTrainer:
 
         self._init_data_selector()
         self._correct_total_training_steps_for_selection()
+        self._cava_logp_warned: set[str] = set()
 
         self.checkpoint_manager = None
 
@@ -1510,6 +1513,304 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
+    @staticmethod
+    def _cava_to_int(value) -> Optional[int]:
+        """Best-effort conversion for dataset indices stored in object arrays."""
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            value = value.detach().cpu().item()
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                return None
+            value = value.reshape(-1)[0]
+        try:
+            if value == "":
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _cava_warn_once(self, key: str, message: str) -> None:
+        if key in self._cava_logp_warned:
+            return
+        self._cava_logp_warned.add(key)
+        print(f"[CAVA] {message}")
+
+    def _extract_cava_dataset_indices(self, batch: DataProto) -> list[Optional[int]]:
+        """Return stable full-dataset indices for each repeated rollout row."""
+        n = len(batch)
+        dataset_idx = batch.non_tensor_batch.get("dataset_idx")
+        if dataset_idx is not None:
+            return [self._cava_to_int(v) for v in dataset_idx]
+
+        extra_info = batch.non_tensor_batch.get("extra_info")
+        if extra_info is None:
+            return [None] * n
+
+        result = []
+        for info in extra_info:
+            if isinstance(info, dict):
+                idx = self._cava_to_int(info.get("index", info.get("dataset_idx")))
+            else:
+                idx = None
+            result.append(idx)
+        return result
+
+    def _select_cava_logp_rows(
+        self,
+        batch: DataProto,
+        cfg,
+    ) -> tuple[list[int], list[int]]:
+        """Pick at most one rollout row per original sample for CAVA scoring."""
+        dataset_indices = self._extract_cava_dataset_indices(batch)
+        first_row_by_dataset = {}
+        for row_idx, dataset_idx in enumerate(dataset_indices):
+            if dataset_idx is None:
+                continue
+            first_row_by_dataset.setdefault(int(dataset_idx), int(row_idx))
+
+        if not first_row_by_dataset:
+            return [], []
+
+        items = list(first_row_by_dataset.items())
+        policy = str(getattr(cfg, "cava_logp_sample_policy", "first") or "first")
+        if policy == "random":
+            rng = np.random.default_rng(int(self.global_steps))
+            order = rng.permutation(len(items))
+            items = [items[i] for i in order]
+        else:
+            items.sort(key=lambda item: item[1])
+
+        max_samples = int(getattr(cfg, "cava_logp_max_samples_per_step", 32) or 0)
+        if max_samples <= 0:
+            return [], []
+        items = items[:max_samples]
+        selected_dataset_indices = [dataset_idx for dataset_idx, _ in items]
+        selected_rows = [row_idx for _, row_idx in items]
+        return selected_rows, selected_dataset_indices
+
+    def _cava_vision_token_ids(self) -> set[int]:
+        """Vision tokens to remove for a true no-image/text-only prompt."""
+        processor = getattr(self, "processor", None)
+        drop_ids = set()
+        for attr in (
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+            "video_start_token_id",
+            "video_end_token_id",
+        ):
+            value = getattr(processor, attr, None)
+            if value is not None:
+                drop_ids.add(int(value))
+
+        tokenizer = getattr(processor, "tokenizer", None) or getattr(self, "tokenizer", None)
+        if tokenizer is not None:
+            for tok in ("<|vision_start|>", "<|vision_end|>", "<|video_start|>", "<|video_end|>"):
+                token_id = tokenizer.convert_tokens_to_ids(tok)
+                if isinstance(token_id, int) and token_id >= 0:
+                    drop_ids.add(token_id)
+        return drop_ids
+
+    def _strip_cava_vision_tokens(
+        self,
+        prompts: torch.Tensor,
+        prompt_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Strip vision tokens from left-padded prompts, preserving tensor shape."""
+        drop_ids = self._cava_vision_token_ids()
+        if not drop_ids:
+            return prompts.clone(), prompt_mask.clone(), 0
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        stripped_prompts = torch.full_like(prompts, int(pad_token_id))
+        stripped_mask = torch.zeros_like(prompt_mask)
+        removed = 0
+        drop_tensor = torch.tensor(sorted(drop_ids), dtype=prompts.dtype, device=prompts.device)
+
+        for i in range(prompts.shape[0]):
+            valid = prompt_mask[i].bool()
+            prompt_valid = prompts[i][valid]
+            if prompt_valid.numel() == 0:
+                continue
+            is_vision = torch.isin(prompt_valid, drop_tensor)
+            kept = prompt_valid[~is_vision]
+            removed += int(is_vision.sum().item())
+            if kept.numel() == 0:
+                continue
+            stripped_prompts[i, -kept.numel():] = kept
+            stripped_mask[i, -kept.numel():] = 1
+
+        return stripped_prompts, stripped_mask, removed
+
+    @staticmethod
+    def _build_cava_text_only_position_ids(
+        attention_mask: torch.Tensor,
+        like_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        base = compute_position_id_with_mask(attention_mask)
+        if like_position_ids.dim() == 3:
+            channels = like_position_ids.shape[1]
+            return base.unsqueeze(1).expand(-1, channels, -1).contiguous()
+        return base
+
+    def _make_cava_no_image_batch(self, batch: DataProto) -> tuple[DataProto, bool]:
+        """Clone a subset batch and score the same response from a text-only prompt."""
+        no_image_batch = deepcopy(batch)
+        changed = False
+
+        if no_image_batch.batch is not None:
+            stale_keys = (
+                "old_log_probs",
+                "entropys",
+                "ref_log_prob",
+                "values",
+                "advantages",
+                "returns",
+                "token_level_scores",
+                "token_level_rewards",
+                "rollout_is_weights",
+                "routed_experts",
+            )
+            for key in stale_keys:
+                if key in no_image_batch.batch.keys():
+                    no_image_batch.batch.pop(key)
+
+            required = ("prompts", "responses", "input_ids", "attention_mask", "position_ids")
+            missing = [key for key in required if key not in no_image_batch.batch.keys()]
+            if missing:
+                raise KeyError(f"cannot build no-image CAVA batch; missing keys: {missing}")
+
+            prompts = no_image_batch.batch["prompts"]
+            responses = no_image_batch.batch["responses"]
+            old_attention = no_image_batch.batch["attention_mask"]
+            prompt_len = prompts.shape[1]
+            prompt_mask = old_attention[:, :prompt_len]
+            response_attention = old_attention[:, prompt_len:]
+
+            stripped_prompts, stripped_prompt_mask, removed = self._strip_cava_vision_tokens(prompts, prompt_mask)
+            no_image_batch.batch["prompts"] = stripped_prompts
+            no_image_batch.batch["input_ids"] = torch.cat([stripped_prompts, responses], dim=1)
+            no_image_batch.batch["attention_mask"] = torch.cat([stripped_prompt_mask, response_attention], dim=1)
+            no_image_batch.batch["position_ids"] = self._build_cava_text_only_position_ids(
+                no_image_batch.batch["attention_mask"],
+                no_image_batch.batch["position_ids"],
+            )
+            changed = removed > 0
+
+        for key in ("multi_modal_inputs", "multi_modal_data"):
+            if key in no_image_batch.non_tensor_batch:
+                no_image_batch.non_tensor_batch.pop(key)
+                changed = True
+
+        return no_image_batch, changed
+
+    def _maybe_compute_cava_logp_contrast(self, batch: DataProto) -> dict[str, float]:
+        """Teacher-force existing responses under a true no-image counterfactual."""
+        selector = getattr(self, "data_selector", None)
+        cfg = getattr(selector, "cluster_config", None)
+        if (
+            not self._data_selection_active
+            or selector is None
+            or cfg is None
+            or not hasattr(selector, "update_cava_logp_contrast")
+            or not getattr(cfg, "cava_vdr_enabled", False)
+            or not getattr(cfg, "cava_use_logp_contrast", False)
+        ):
+            return {}
+
+        metrics = {"data_selection/cava_logp_n_this_step": 0.0}
+        every_n = max(1, int(getattr(cfg, "cava_logp_every_n_steps", 1) or 1))
+        if int(self.global_steps) % every_n != 0:
+            return metrics
+
+        mode = str(getattr(cfg, "cava_null_image_mode", "drop_vision") or "drop_vision")
+        if mode not in {"drop_vision", "no_image", "text_only"}:
+            self._cava_warn_once(
+                "unsupported_mode",
+                f"Skipping online log-prob contrast: unsupported cava_null_image_mode={mode!r}.",
+            )
+            metrics["data_selection/cava_logp_error"] = 1.0
+            return metrics
+
+        if "old_log_probs" not in batch.batch.keys() or "response_mask" not in batch.batch.keys():
+            self._cava_warn_once(
+                "missing_real_logp",
+                "Skipping online log-prob contrast: old_log_probs or response_mask is missing.",
+            )
+            metrics["data_selection/cava_logp_error"] = 1.0
+            return metrics
+
+        selected_rows, dataset_indices = self._select_cava_logp_rows(batch, cfg)
+        if not selected_rows:
+            self._cava_warn_once(
+                "missing_dataset_idx",
+                "Skipping online log-prob contrast: no stable dataset_idx/extra_info index found.",
+            )
+            return metrics
+
+        start = time.perf_counter()
+        try:
+            selected_batch = batch[selected_rows]
+            null_batch, changed = self._make_cava_no_image_batch(selected_batch)
+            if not changed:
+                self._cava_warn_once(
+                    "no_visual_content",
+                    "Skipping online log-prob contrast: no vision tokens/multimodal inputs found to drop.",
+                )
+                return metrics
+
+            null_old_log_prob, _ = self._compute_old_log_prob(null_batch)
+            if "old_log_probs" in null_old_log_prob.batch.keys():
+                null_log_probs = null_old_log_prob.batch["old_log_probs"]
+            elif "log_probs" in null_old_log_prob.batch.keys():
+                null_log_probs = null_old_log_prob.batch["log_probs"]
+            else:
+                null_log_probs = None
+            if null_log_probs is None:
+                raise KeyError("null log-prob output has neither old_log_probs nor log_probs")
+
+            row_tensor = torch.as_tensor(
+                selected_rows,
+                dtype=torch.long,
+                device=batch.batch["old_log_probs"].device,
+            )
+            real = batch.batch["old_log_probs"].index_select(0, row_tensor)
+            mask = batch.batch["response_mask"].index_select(0, row_tensor).float()
+            null = null_log_probs.to(device=real.device, dtype=real.dtype)
+            if tuple(real.shape) != tuple(null.shape):
+                raise ValueError(f"log-prob shape mismatch: real={tuple(real.shape)} null={tuple(null.shape)}")
+
+            contrast = ((real - null) * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
+            contrast_np = contrast.detach().cpu().numpy().astype(np.float32)
+            finite = contrast_np[np.isfinite(contrast_np)]
+            selector.update_cava_logp_contrast(dataset_indices, contrast_np, step=self.global_steps)
+
+            metrics["data_selection/cava_logp_n_this_step"] = float(len(contrast_np))
+            metrics["data_selection/cava_logp_overhead_seconds"] = float(time.perf_counter() - start)
+            metrics["data_selection/cava_logp_error"] = 0.0
+            if finite.size:
+                metrics["data_selection/cava_logp_mean_this_step"] = float(finite.mean())
+                metrics["data_selection/cava_logp_std_this_step"] = float(finite.std())
+                metrics["data_selection/cava_logp_min_this_step"] = float(finite.min())
+                metrics["data_selection/cava_logp_max_this_step"] = float(finite.max())
+            return metrics
+        except Exception as e:
+            self._cava_warn_once(
+                "logp_exception",
+                f"Skipping online log-prob contrast after an error: {type(e).__name__}: {e}",
+            )
+            metrics["data_selection/cava_logp_overhead_seconds"] = float(time.perf_counter() - start)
+            metrics["data_selection/cava_logp_error"] = 1.0
+            return metrics
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1820,6 +2121,7 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                            metrics.update(self._maybe_compute_cava_logp_contrast(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 

@@ -129,6 +129,49 @@ class ClusterSelectorConfig:
     # Set to 1.0 (default) to disable.
     observed_deadzone_high: float = 1.0
 
+    # --- Static-VDR: true no-image audit prior, CPU-built ---
+    vdr_enabled: bool = False
+    vdr_static_prior_file: Optional[str] = None
+    vdr_gate_floor: float = 0.7
+    vdr_gate_threshold: float = 0.10
+    vdr_gate_temperature: float = 0.10
+    vdr_apply_to_sample_utility: bool = True
+    vdr_apply_to_cluster_allocation: bool = False
+    vdr_cluster_blend: float = 0.25
+
+    # --- CAVA-VDR: Counterfactual-Attention Visual Attribution, v1 ---
+    cava_vdr_enabled: bool = False
+
+    # Static VDR prior from offline audit / cluster smoothing.
+    cava_static_prior_file: Optional[str] = None
+    cava_weight_static_prior: float = 1.0
+
+    # Online null-image log-prob contrast.
+    cava_use_logp_contrast: bool = False
+    cava_weight_logp_contrast: float = 1.0
+    cava_logp_decay_rate: float = 0.05
+    cava_logp_max_age: int = 500
+    cava_logp_min_points_for_interp: int = 5
+
+    # Soft gate.
+    cava_gate_floor: float = 0.7
+    cava_gate_temperature: float = 1.0
+    cava_gate_threshold: float = 0.0
+    cava_robust_normalize: bool = True
+
+    # Where to apply the gate.
+    cava_apply_to_sample_utility: bool = True
+    cava_apply_to_cluster_allocation: bool = False
+    cava_cluster_gate_blend: float = 0.25
+
+    # Trainer-side CAVA log-prob settings, read through cluster_config.
+    cava_logp_every_n_steps: int = 1
+    cava_logp_max_samples_per_step: int = 32
+    cava_null_image_mode: str = "drop_vision"
+    cava_logp_sample_policy: str = "first"
+
+    # Attention and sparse null-image rollout probes are deferred to future work.
+
     # --- Image Grounding Score (IGS) ---
     # Measures multimodal dependency: ratio of reward variance WITH image to
     # variance WITHOUT image.  High IGS means the image is essential for
@@ -334,6 +377,25 @@ class ClusterSelector(DataSelector):
         self._igs_scores: Optional[np.ndarray] = None  # shape (N,), per-sample
         self._cluster_igs: Dict[int, float] = {}  # cluster_id -> mean IGS
 
+        # --- Static-VDR ---
+        self._vdr_sample_delta_prior: Optional[np.ndarray] = None
+        self._vdr_sample_confidence: Optional[np.ndarray] = None
+        self._vdr_cluster_delta_mean: Optional[np.ndarray] = None
+        self._vdr_cluster_delta_count: Optional[np.ndarray] = None
+        self._last_vdr_gate: Optional[np.ndarray] = None
+        self._last_vdr_metrics: Dict[str, float] = {}
+
+        # --- CAVA-VDR v1 ---
+        # Static prior and online null-image log-prob contrast buffers are in
+        # NPZ/embedding index space.
+        self._cava_static_prior: Optional[np.ndarray] = None
+        self._cava_cluster_prior: Optional[np.ndarray] = None
+        self._cava_logp_buffer: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+        self._last_cava_logp_interp: Optional[np.ndarray] = None
+        self._last_cava_score: Optional[np.ndarray] = None
+        self._last_cava_gate: Optional[np.ndarray] = None
+        self._last_cava_metrics: Dict[str, float] = {}
+
         # Time-weighted rollout history buffer.
         # Keys are NPZ positions (0..N-1). Seeded with REPR rollouts;
         # grows with training rollouts when alignment map is available.
@@ -460,6 +522,8 @@ class ClusterSelector(DataSelector):
             "_frozen_pool_npz": self._frozen_pool_npz,
             # Rollout history buffer (core DOTS signal)
             "_rollout_buffer": dict(self._rollout_buffer),
+            # CAVA-VDR online signal buffers
+            "_cava_logp_buffer": dict(self._cava_logp_buffer),
             # Cluster-level signals
             "_cluster_variances": dict(self._cluster_variances),
             "_cluster_mean_rewards": dict(self._cluster_mean_rewards),
@@ -495,6 +559,7 @@ class ClusterSelector(DataSelector):
 
         self._frozen_pool_npz = state["_frozen_pool_npz"]
         self._rollout_buffer = state["_rollout_buffer"]
+        self._cava_logp_buffer = defaultdict(list, state.get("_cava_logp_buffer", {}))
 
         self._cluster_variances = state["_cluster_variances"]
         self._cluster_mean_rewards = state["_cluster_mean_rewards"]
@@ -550,6 +615,8 @@ class ClusterSelector(DataSelector):
                   "Set data_selection.cluster.dataset_json_file to the JSON source "
                   "used to build the embeddings.")
 
+        self._load_vdr_static_prior()
+        self._load_cava_static_prior()
         self._select_representatives()
 
         if self.cluster_config.strategy in ("scored", "interpolated"):
@@ -794,6 +861,384 @@ class ClusterSelector(DataSelector):
             if p >= 0:
                 result.append(p)
         return result
+
+    def _dataset_index_to_npz(self, dataset_idx: int) -> Optional[int]:
+        """Map a parquet/dataloader index to NPZ index space."""
+        if self._dataset_to_npz is not None:
+            npz_idx = self._dataset_to_npz.get(int(dataset_idx), -1)
+            return int(npz_idx) if npz_idx >= 0 else None
+        return int(dataset_idx)
+
+    # ------------------------------------------------------------------
+    # Static-VDR: true no-image audit prior
+    # ------------------------------------------------------------------
+
+    def _load_vdr_static_prior(self) -> None:
+        """Load CPU-built static VDR prior in NPZ/embedding order."""
+        cfg = self.cluster_config
+        path = cfg.vdr_static_prior_file
+        self._vdr_sample_delta_prior = None
+        self._vdr_sample_confidence = None
+        self._vdr_cluster_delta_mean = None
+        self._vdr_cluster_delta_count = None
+
+        if not cfg.vdr_enabled or not path:
+            return
+
+        try:
+            data = np.load(path, allow_pickle=True)
+        except Exception as e:
+            print(f"[StaticVDR] Failed to load prior from {path}: {e}")
+            return
+
+        n = len(self._embeddings)
+        k = self._centroids.shape[0] if self._centroids is not None else 0
+
+        sample_prior = None
+        for key in ("sample_delta_prior", "sample_prior", "prior"):
+            if key in data:
+                sample_prior = data[key].astype(np.float32)
+                break
+        if sample_prior is not None:
+            if len(sample_prior) != n:
+                print(
+                    f"[StaticVDR] sample prior length mismatch: "
+                    f"{len(sample_prior)} vs embeddings {n}; disabling Static-VDR."
+                )
+                sample_prior = None
+            else:
+                self._vdr_sample_delta_prior = sample_prior
+
+        if "sample_prior_confidence" in data:
+            confidence = data["sample_prior_confidence"].astype(np.float32)
+            if len(confidence) == n:
+                self._vdr_sample_confidence = confidence
+
+        cluster_prior = None
+        for key in ("cluster_delta_mean", "cluster_prior"):
+            if key in data:
+                cluster_prior = data[key].astype(np.float32)
+                break
+        if cluster_prior is not None:
+            if len(cluster_prior) != k:
+                print(
+                    f"[StaticVDR] cluster prior length mismatch: "
+                    f"{len(cluster_prior)} vs clusters {k}; ignoring cluster prior."
+                )
+            else:
+                self._vdr_cluster_delta_mean = cluster_prior
+                if self._vdr_sample_delta_prior is None:
+                    self._vdr_sample_delta_prior = cluster_prior[self._cluster_ids].astype(np.float32)
+
+        if "cluster_delta_count" in data:
+            counts = data["cluster_delta_count"].astype(np.float32)
+            if len(counts) == k:
+                self._vdr_cluster_delta_count = counts
+
+        if self._vdr_sample_delta_prior is None:
+            print(f"[StaticVDR] No usable static prior found in {path}")
+            return
+
+        finite = self._vdr_sample_delta_prior[np.isfinite(self._vdr_sample_delta_prior)]
+        msg = (
+            f"mean={float(finite.mean()):.4f}, std={float(finite.std()):.4f}, "
+            f"min={float(finite.min()):.4f}, max={float(finite.max()):.4f}"
+            if finite.size
+            else "no finite values"
+        )
+        print(f"[StaticVDR] Loaded prior from {path}: {msg}")
+
+    def _compute_vdr_gate(self) -> np.ndarray:
+        """Direct soft gate from raw true-no-image delta prior."""
+        cfg = self.cluster_config
+        n = len(self._embeddings)
+        if not cfg.vdr_enabled or self._vdr_sample_delta_prior is None:
+            gate = np.ones(n, dtype=np.float32)
+            self._last_vdr_gate = gate
+            self._last_vdr_metrics = {
+                "data_selection/vdr_gate_mean_all": 1.0,
+                "data_selection/vdr_score_mean_all": 0.0,
+            }
+            return gate
+
+        score = np.asarray(self._vdr_sample_delta_prior, dtype=np.float32)
+        score = np.where(np.isfinite(score), score, 0.0).astype(np.float32)
+        floor = float(np.clip(cfg.vdr_gate_floor, 0.0, 1.0))
+        temp = max(float(cfg.vdr_gate_temperature), 1e-8)
+        logits = np.clip((score - float(cfg.vdr_gate_threshold)) / temp, -50.0, 50.0)
+        sig = 1.0 / (1.0 + np.exp(-logits))
+        gate = (floor + (1.0 - floor) * sig).astype(np.float32)
+        gate = np.clip(gate, floor, 1.0)
+
+        self._last_vdr_gate = gate
+        self._last_vdr_metrics = {
+            "data_selection/vdr_gate_mean_all": float(gate.mean()),
+            "data_selection/vdr_gate_std_all": float(gate.std()),
+            "data_selection/vdr_gate_min_all": float(gate.min()),
+            "data_selection/vdr_gate_max_all": float(gate.max()),
+            "data_selection/vdr_score_mean_all": float(score.mean()),
+            "data_selection/vdr_score_std_all": float(score.std()),
+        }
+        return gate
+
+    def _record_vdr_selection_metrics(self, selected_npz: List[int], gate: np.ndarray) -> None:
+        if not selected_npz or self._vdr_sample_delta_prior is None:
+            return
+        sel = np.asarray(selected_npz, dtype=np.int64)
+        sel = sel[(sel >= 0) & (sel < len(gate))]
+        if sel.size == 0:
+            return
+
+        score_sel = self._vdr_sample_delta_prior[sel].astype(np.float64)
+        gate_sel = gate[sel].astype(np.float64)
+        low_gate = gate_sel <= (float(self.cluster_config.vdr_gate_floor) + 1e-6)
+        metrics = dict(self._last_vdr_metrics)
+        metrics.update(
+            {
+                "data_selection/vdr_gate_mean_selected": float(gate_sel.mean()),
+                "data_selection/vdr_gate_min_selected": float(gate_sel.min()),
+                "data_selection/vdr_gate_max_selected": float(gate_sel.max()),
+                "data_selection/vdr_score_mean_selected": float(score_sel.mean()),
+                "data_selection/vdr_score_std_selected": float(score_sel.std()),
+                "data_selection/vdr_low_gate_selected_frac": float(low_gate.mean()),
+            }
+        )
+        self._last_vdr_metrics = metrics
+
+    # ------------------------------------------------------------------
+    # CAVA-VDR v1: static prior + null-image log-prob contrast
+    # ------------------------------------------------------------------
+
+    def _load_cava_static_prior(self) -> None:
+        """Load optional CAVA static prior in NPZ/embedding order."""
+        cfg = self.cluster_config
+        path = cfg.cava_static_prior_file
+        self._cava_static_prior = None
+        self._cava_cluster_prior = None
+
+        if not cfg.cava_vdr_enabled or not path:
+            return
+
+        try:
+            data = np.load(path, allow_pickle=True)
+        except Exception as e:
+            print(f"[CAVA] Failed to load static prior from {path}: {e}")
+            return
+
+        n = len(self._embeddings)
+        k = self._centroids.shape[0] if self._centroids is not None else 0
+
+        sample_prior = None
+        for key in ("sample_prior", "prior", "cava_prior", "delta_prior"):
+            if key in data:
+                sample_prior = data[key].astype(np.float32)
+                break
+
+        if sample_prior is not None:
+            if len(sample_prior) != n:
+                print(
+                    f"[CAVA] Static sample prior length mismatch: "
+                    f"{len(sample_prior)} vs embeddings {n}; disabling sample prior."
+                )
+            else:
+                self._cava_static_prior = sample_prior
+
+        if "cluster_prior" in data:
+            cluster_prior = data["cluster_prior"].astype(np.float32)
+            if len(cluster_prior) != k:
+                print(
+                    f"[CAVA] Static cluster prior length mismatch: "
+                    f"{len(cluster_prior)} vs clusters {k}; ignoring cluster prior."
+                )
+            else:
+                self._cava_cluster_prior = cluster_prior
+                if self._cava_static_prior is None:
+                    self._cava_static_prior = cluster_prior[self._cluster_ids].astype(np.float32)
+
+        if self._cava_static_prior is not None:
+            finite = self._cava_static_prior[np.isfinite(self._cava_static_prior)]
+            msg = (
+                f"mean={float(finite.mean()):.4f}, std={float(finite.std()):.4f}"
+                if finite.size
+                else "no finite values"
+            )
+            print(f"[CAVA] Loaded static prior from {path}: {msg}")
+        else:
+            print(f"[CAVA] No usable static prior found in {path}")
+
+    def update_cava_logp_contrast(
+        self,
+        dataset_indices: List[int],
+        contrasts: np.ndarray,
+        step: Optional[int] = None,
+    ) -> None:
+        """Store online null-image log-prob contrasts.
+
+        dataset_indices are parquet/dataloader indices. Contrasts are scalar
+        per original sample: mean_response_tokens(logp_real - logp_null).
+        """
+        cfg = self.cluster_config
+        if not cfg.cava_vdr_enabled or not cfg.cava_use_logp_contrast:
+            return
+
+        current_step = self._current_training_step if step is None else int(step)
+        self._current_training_step = current_step
+        max_age = int(cfg.cava_logp_max_age)
+        n_added = 0
+
+        for dataset_idx, contrast in zip(dataset_indices, np.asarray(contrasts, dtype=np.float32)):
+            if not np.isfinite(contrast):
+                continue
+            npz_idx = self._dataset_index_to_npz(int(dataset_idx))
+            if npz_idx is None or npz_idx < 0 or npz_idx >= len(self._embeddings):
+                continue
+            hist = self._cava_logp_buffer[int(npz_idx)]
+            hist.append((current_step, float(contrast)))
+            if max_age > 0:
+                self._cava_logp_buffer[int(npz_idx)] = [
+                    (t, v) for t, v in hist if current_step - int(t) <= max_age
+                ]
+            n_added += 1
+
+        if n_added > 0:
+            print(
+                f"[CAVA] Added {n_added} log-prob contrasts "
+                f"(observed_npz={len(self._cava_logp_buffer)})"
+            )
+
+    def _aggregate_and_interpolate_cava_logp(self) -> Optional[np.ndarray]:
+        cfg = self.cluster_config
+        if not self._cava_logp_buffer:
+            self._last_cava_logp_interp = None
+            return None
+
+        from .vdr_utils import fill_by_cluster_mean, knn_interpolate_values, time_weighted_scalar
+
+        ref_idx = []
+        ref_val = []
+        for npz_idx, history in self._cava_logp_buffer.items():
+            val = time_weighted_scalar(
+                history,
+                current_step=self._current_training_step,
+                decay_rate=cfg.cava_logp_decay_rate,
+                max_age=cfg.cava_logp_max_age,
+            )
+            if val is None or not np.isfinite(val):
+                continue
+            ref_idx.append(int(npz_idx))
+            ref_val.append(float(val))
+
+        if len(ref_idx) < int(cfg.cava_logp_min_points_for_interp):
+            self._last_cava_logp_interp = None
+            return None
+
+        interp = knn_interpolate_values(
+            self._embeddings,
+            np.array(ref_idx, dtype=np.int64),
+            np.array(ref_val, dtype=np.float32),
+            temperature=self.cluster_config.dots_temperature,
+            top_k=self.cluster_config.dots_top_k,
+        )
+        interp = fill_by_cluster_mean(interp, self._cluster_ids, default=0.0)
+        self._last_cava_logp_interp = interp
+        return interp
+
+    def _compute_cava_gate(self, base_utility: np.ndarray) -> np.ndarray:
+        cfg = self.cluster_config
+        n = len(self._embeddings)
+        if not cfg.cava_vdr_enabled:
+            return np.ones(n, dtype=np.float32)
+
+        from .vdr_utils import robust_zscore, sigmoid_gate
+
+        channels = []
+        weights = []
+        channel_names = []
+
+        if self._cava_static_prior is not None and float(cfg.cava_weight_static_prior) != 0.0:
+            channels.append(robust_zscore(self._cava_static_prior))
+            weights.append(float(cfg.cava_weight_static_prior))
+            channel_names.append("static")
+
+        if cfg.cava_use_logp_contrast and float(cfg.cava_weight_logp_contrast) != 0.0:
+            logp_values = self._aggregate_and_interpolate_cava_logp()
+            if logp_values is not None:
+                channels.append(robust_zscore(logp_values))
+                weights.append(float(cfg.cava_weight_logp_contrast))
+                channel_names.append("logp")
+
+        if not channels:
+            gate = np.ones(n, dtype=np.float32)
+            self._last_cava_gate = gate
+            self._last_cava_score = None
+            self._last_cava_metrics = {
+                "data_selection/cava_gate_mean_all": 1.0,
+                "data_selection/cava_gate_std_all": 0.0,
+            }
+            return gate
+
+        stack = np.stack(channels, axis=0)
+        weight_arr = np.asarray(weights, dtype=np.float32)
+        weight_arr /= max(float(weight_arr.sum()), 1e-8)
+        score = np.sum(stack * weight_arr[:, None], axis=0).astype(np.float32)
+        if cfg.cava_robust_normalize:
+            score = robust_zscore(score)
+
+        gate = sigmoid_gate(
+            score,
+            floor=cfg.cava_gate_floor,
+            threshold=cfg.cava_gate_threshold,
+            temperature=cfg.cava_gate_temperature,
+        )
+
+        finite_score = score[np.isfinite(score)]
+        self._last_cava_gate = gate
+        self._last_cava_score = score
+        self._last_cava_metrics = {
+            "data_selection/cava_gate_mean_all": float(gate.mean()),
+            "data_selection/cava_gate_std_all": float(gate.std()),
+            "data_selection/cava_score_mean_all": float(finite_score.mean()) if finite_score.size else 0.0,
+            "data_selection/cava_score_std_all": float(finite_score.std()) if finite_score.size else 0.0,
+            "data_selection/cava_channels": float(len(channel_names)),
+        }
+        return gate
+
+    def _record_cava_selection_metrics(
+        self,
+        selected_npz: List[int],
+        utility_before: np.ndarray,
+        utility_after: np.ndarray,
+        gate: np.ndarray,
+    ) -> None:
+        if not selected_npz:
+            return
+        sel = np.asarray(selected_npz, dtype=np.int64)
+        sel = sel[(sel >= 0) & (sel < len(gate))]
+        if sel.size == 0:
+            return
+
+        before = utility_before[sel].astype(np.float64)
+        after = utility_after[sel].astype(np.float64)
+        gate_sel = gate[sel].astype(np.float64)
+        ratio = after / np.maximum(before, 1e-12)
+
+        metrics = dict(self._last_cava_metrics)
+        metrics.update(
+            {
+                "data_selection/cava_gate_mean_selected": float(gate_sel.mean()),
+                "data_selection/cava_gate_min_selected": float(gate_sel.min()),
+                "data_selection/cava_gate_max_selected": float(gate_sel.max()),
+                "data_selection/cava_utility_before_mean_selected": float(before.mean()),
+                "data_selection/cava_utility_after_mean_selected": float(after.mean()),
+                "data_selection/cava_utility_ratio_mean_selected": float(ratio.mean()),
+            }
+        )
+        if self._last_cava_score is not None:
+            score_sel = self._last_cava_score[sel]
+            finite_score = score_sel[np.isfinite(score_sel)]
+            if finite_score.size:
+                metrics["data_selection/cava_score_mean_selected"] = float(finite_score.mean())
+        self._last_cava_metrics = metrics
 
     @staticmethod
     def _knn_density(embeddings: np.ndarray, k: int = 10) -> np.ndarray:
@@ -2163,6 +2608,23 @@ class ClusterSelector(DataSelector):
                     f"(observed R_with > {obs_high:.2f})"
                 )
 
+        # --- CAVA soft VDR gate ---
+        utility_before_cava = predicted_var.copy()
+        utility_after_cava = predicted_var
+        cava_gate = None
+        if self.cluster_config.cava_vdr_enabled:
+            cava_gate = self._compute_cava_gate(predicted_var)
+            if self.cluster_config.cava_apply_to_sample_utility:
+                predicted_var = (predicted_var * cava_gate).astype(np.float32)
+            utility_after_cava = predicted_var.copy()
+
+        # --- Static-VDR soft gate from true no-image audit prior ---
+        vdr_gate = None
+        if self.cluster_config.vdr_enabled:
+            vdr_gate = self._compute_vdr_gate()
+            if self.cluster_config.vdr_apply_to_sample_utility:
+                predicted_var = (predicted_var * vdr_gate).astype(np.float32)
+
         # --- Exclude already-selected samples ---
         # Without this, top-K selection keeps re-picking the same high-variance
         # cluster every round, so cumulative unique grows very slowly and the
@@ -2195,6 +2657,12 @@ class ClusterSelector(DataSelector):
         if not self.cluster_config.dots_diversity:
             # Global top-k: pure ranking by predicted variance
             top_indices = np.argsort(-predicted_var)[:budget]
+            if self.cluster_config.cava_vdr_enabled and cava_gate is not None:
+                self._record_cava_selection_metrics(
+                    top_indices.tolist(), utility_before_cava, utility_after_cava, cava_gate
+                )
+            if self.cluster_config.vdr_enabled and vdr_gate is not None:
+                self._record_vdr_selection_metrics(top_indices.tolist(), vdr_gate)
             return top_indices.tolist()
 
         # Diversity mode: allocate budget across clusters via softmax, then
@@ -2212,6 +2680,8 @@ class ClusterSelector(DataSelector):
 
         if not cluster_pred_var:
             top_indices = np.argsort(-predicted_var)[:budget]
+            if self.cluster_config.vdr_enabled and vdr_gate is not None:
+                self._record_vdr_selection_metrics(top_indices.tolist(), vdr_gate)
             return top_indices.tolist()
 
         # Step 2: compute per-cluster allocation scores.
@@ -2241,6 +2711,30 @@ class ClusterSelector(DataSelector):
                 cluster_scores[c_id] = score
             else:
                 cluster_scores[c_id] = cpv
+
+        if (
+            self.cluster_config.cava_vdr_enabled
+            and self.cluster_config.cava_apply_to_cluster_allocation
+            and cava_gate is not None
+        ):
+            blend = float(np.clip(self.cluster_config.cava_cluster_gate_blend, 0.0, 1.0))
+            for c_id in list(cluster_scores.keys()):
+                mask = self._cluster_ids == c_id
+                if mask.any():
+                    mean_gate = float(np.mean(cava_gate[mask]))
+                    cluster_scores[c_id] *= (1.0 - blend) + blend * mean_gate
+
+        if (
+            self.cluster_config.vdr_enabled
+            and self.cluster_config.vdr_apply_to_cluster_allocation
+            and vdr_gate is not None
+        ):
+            blend = float(np.clip(self.cluster_config.vdr_cluster_blend, 0.0, 1.0))
+            for c_id in list(cluster_scores.keys()):
+                mask = self._cluster_ids == c_id
+                if mask.any():
+                    mean_gate = float(np.mean(vdr_gate[mask]))
+                    cluster_scores[c_id] *= (1.0 - blend) + blend * mean_gate
 
         # Step 3: compute current temperature (fixed or annealed).
         if self.cluster_config.dots_diversity_anneal:
@@ -2282,6 +2776,12 @@ class ClusterSelector(DataSelector):
               f"{n_clusters_used} clusters, {len(selected)} samples, "
               f"temp={temperature:.4f} (round={self._selection_round}), "
               f"composite={'on' if use_composite else 'off'}")
+        if self.cluster_config.cava_vdr_enabled and cava_gate is not None:
+            self._record_cava_selection_metrics(
+                selected, utility_before_cava, utility_after_cava, cava_gate
+            )
+        if self.cluster_config.vdr_enabled and vdr_gate is not None:
+            self._record_vdr_selection_metrics(selected, vdr_gate)
         return selected
 
     def _dots_interpolate(
@@ -2533,6 +3033,56 @@ class ClusterSelector(DataSelector):
             metrics["data_selection/n_multimodal_clusters"] = sum(
                 1 for v in igs_vals if v > 1.5
             )
+
+        # --- Static-VDR metrics ---
+        if self.cluster_config.vdr_enabled:
+            metrics["data_selection/vdr_enabled"] = 1.0
+            metrics["data_selection/vdr_prior_loaded"] = float(
+                self._vdr_sample_delta_prior is not None
+            )
+            if self._vdr_cluster_delta_count is not None:
+                covered = self._vdr_cluster_delta_count > 0
+                metrics["data_selection/vdr_clusters_with_audit"] = float(covered.sum())
+                metrics["data_selection/vdr_cluster_coverage_frac"] = float(
+                    covered.sum() / max(len(covered), 1)
+                )
+            if self._last_vdr_gate is not None:
+                gate = self._last_vdr_gate
+                metrics["data_selection/vdr_gate_mean_all"] = float(np.mean(gate))
+                metrics["data_selection/vdr_gate_std_all"] = float(np.std(gate))
+                metrics["data_selection/vdr_gate_min_all"] = float(np.min(gate))
+                metrics["data_selection/vdr_gate_max_all"] = float(np.max(gate))
+            metrics.update(self._last_vdr_metrics)
+        else:
+            metrics["data_selection/vdr_enabled"] = 0.0
+
+        # --- CAVA-VDR metrics ---
+        if self.cluster_config.cava_vdr_enabled:
+            metrics["data_selection/cava_enabled"] = 1.0
+            metrics["data_selection/cava_static_prior_loaded"] = float(
+                self._cava_static_prior is not None
+            )
+            metrics["data_selection/cava_logp_buffer_size"] = float(
+                sum(len(v) for v in self._cava_logp_buffer.values())
+            )
+            metrics["data_selection/cava_logp_observed_npz"] = float(
+                len(self._cava_logp_buffer)
+            )
+            metrics["data_selection/cava_static_weight"] = float(
+                self.cluster_config.cava_weight_static_prior
+            )
+            metrics["data_selection/cava_logp_weight"] = float(
+                self.cluster_config.cava_weight_logp_contrast
+            )
+            if self._last_cava_gate is not None:
+                gate = self._last_cava_gate
+                metrics["data_selection/cava_gate_mean_all"] = float(np.mean(gate))
+                metrics["data_selection/cava_gate_std_all"] = float(np.std(gate))
+                metrics["data_selection/cava_gate_min_all"] = float(np.min(gate))
+                metrics["data_selection/cava_gate_max_all"] = float(np.max(gate))
+            metrics.update(self._last_cava_metrics)
+        else:
+            metrics["data_selection/cava_enabled"] = 0.0
 
         # --- Variance predictor metrics ---
         metrics.update(self._predictor.get_metrics())
