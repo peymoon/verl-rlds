@@ -3,7 +3,7 @@ Online data selection for GRPO/PPO training.
 
 Provides a pluggable interface for adaptive data selection during training.
 The training loop calls a stable DataSelector interface; concrete implementations
-handle the strategy (random, DOTS, cluster-based, etc.).
+handle the strategy (random, DOTS, cluster-based, VADE, etc.).
 
 Usage:
     from verl.trainer.ppo.data_selector import build_selector
@@ -19,7 +19,7 @@ def build_selector(config) -> DataSelector:
 
     Args:
         config: OmegaConf or dict with at least a 'method' key.
-                Recognized methods: 'none', 'random', 'dots', 'cluster'.
+                Recognized methods: 'none', 'random', 'dots', 'cluster', 'vade'.
 
     Returns:
         A DataSelector instance ready for initialize().
@@ -47,10 +47,13 @@ def build_selector(config) -> DataSelector:
     elif method == "cluster":
         from .cluster_selector import ClusterSelector
         return ClusterSelector(ds_config)
+    elif method == "vade":
+        from .vade_selector import VadeSelector
+        return VadeSelector(ds_config)
     else:
         raise ValueError(
             f"Unknown data selection method: '{method}'. "
-            f"Choose from: none, random, dots, cluster"
+            f"Choose from: none, random, dots, cluster, vade"
         )
 
 
@@ -71,13 +74,16 @@ def _to_ds_config(config) -> DataSelectionConfig:
         raw = {}
         for key in (
             "method",
+            "seed",
             "reselect_schedule",
             "reselect_interval",
             "selection_budget",
             "selection_budget_pct",
             "global_budget_pct",
+            "global_budget_count",
             "cluster",
             "dots",
+            "vade",
         ):
             val = getattr(config, key, None) if hasattr(config, key) else None
             if val is None and isinstance(config, dict):

@@ -52,7 +52,6 @@ K_FINAL="${K_FINAL:-200}"
 N_REPS="${N_REPS:-3}"
 CLUSTER_ARRAYS="${CLUSTER_ARRAYS:-/workspace/rl_data_selection/benchmark/rl_data_selection/cluster_selection/outputs_200_cluster_new/cluster_arrays.npz}"
 
-export WANDB_API_KEY='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'
 
 for p in "$TRAIN_PARQUET" "$VAL_PARQUET" "$CLUSTER_ARRAYS" "$DATASET_JSON"; do
     if [ ! -e "$p" ]; then

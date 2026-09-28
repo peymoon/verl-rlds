@@ -113,11 +113,14 @@ algorithm:
 
 # config for online data selection during training
 # When method is "none" (default), the full dataset is used every epoch.
-# Set method to "random", "dots", or "cluster" to enable adaptive selection.
+# Set method to "random", "dots", "cluster", or "vade" to enable adaptive selection.
 data_selection:
 
-  # Selection method: "none" | "random" | "dots" | "cluster"
+  # Selection method: "none" | "random" | "dots" | "cluster" | "vade"
   method: none
+
+  # Seed shared by selectors and selected-subset dataloader rebuilding.
+  seed: 42
 
   # When to apply reselect_interval:
   #   "epoch" — at the start of each epoch (every N epochs).
@@ -143,6 +146,11 @@ data_selection:
   # Set equal to selection_budget_pct for a fair comparison with a fixed random
   # baseline (e.g., both 10% → exactly 10% unique samples over the entire run).
   global_budget_pct: null
+
+  # Optional absolute unique-prompt cap. When non-null, this takes precedence
+  # over global_budget_pct. Use it when the paper budget is defined relative to
+  # a source corpus but selection operates on a smaller train split.
+  global_budget_count: null
 
   # Cluster-specific settings (used when method=cluster)
   cluster:
@@ -264,6 +272,21 @@ data_selection:
   # DOTS-specific settings (used when method=dots)
   dots:
 
+    # Cached embeddings used by DOTS teacher inference.  For multimodal runs,
+    # point this at the Qwen-VL embedding NPZ for the same train split.  A
+    # cluster_arrays.npz with an "embeddings" field also works.
+    embeddings_file: null
+    cluster_arrays_file: null
+
+    # JSON/JSONL used to build the embeddings.  Strongly recommended when the
+    # embedding NPZ row order can differ from the train parquet row order; DOTS
+    # uses it to map NPZ rows back to parquet rows for multimodal generation.
+    dataset_json_file: null
+
+    # Keep false for learned DOTS checkpoints, which were trained on raw cached
+    # embeddings.  It can be set true for the no-checkpoint identity fallback.
+    normalize_embeddings: false
+
     # Number of random reference samples per selection round
     ref_size: 256
 
@@ -273,7 +296,28 @@ data_selection:
     # Softmax temperature for difficulty-based sampling
     tau: 0.001
 
-    # Path to teacher model checkpoint (null = use interpolation fallback)
+    # Random seed for reference sampling / DOTS multinomial sampling
+    seed: 42
+
+    # For matched unique-budget comparisons, set true so pre-freeze rounds add
+    # new prompts until global_budget_pct is reached.  For literal original
+    # DOTS with no unique cap, leave false.
+    exclude_already_selected: false
+
+    # When global_budget_pct freezes the pool, skip additional reference
+    # rollouts and reweight within the frozen pool using the last predictions.
+    skip_reference_when_frozen: true
+
+    # When true, reference probes count toward the same unique verified-prompt
+    # cap as selected training prompts. Use this for strict low-budget
+    # comparisons; leave false to mimic original DOTS-style extra references
+    # while reporting reference overhead separately.
+    count_references_in_budget: false
+
+    # Path to DOTS teacher checkpoint.  Must match the embedding dimension.
+    # The public data-efficient-llm-rl checkpoint is Qwen2.5-Math/text (1536d);
+    # Qwen3-VL VIRL embeddings are 2048d, so train/export a matching teacher
+    # or leave this null to use the identity-attention fallback baseline.
     teacher_checkpoint: null
 
     # Teacher model name
@@ -282,11 +326,68 @@ data_selection:
     # Batch size for teacher prediction
     teacher_batch_size: 32
 
+    # auto | cpu | cuda | cuda:0 ... ; original DOTS used a GPU teacher worker.
+    teacher_device: auto
+
+    # Defaults match data-efficient-llm-rl/run_bash/final_ds_teacher_replay.sh.
+    # When a checkpoint is provided, the selector infers these from its weights.
+    teacher_hidden_size: 896
+    teacher_num_layers: 3
+    teacher_scaling: group_logit_temp
+    teacher_top_k: null
+    teacher_tau: 1.0
+
+    # Original DOTS linearly calibrated teacher predictions on the reference
+    # points each selection round before sampling.
+    calibrate_predictions: true
+    clip_predictions: false
+
+    # If true, fail fast when teacher_checkpoint is missing.
+    require_teacher_checkpoint: false
+
+    # No-checkpoint runnable baseline: same attention/regression shape but with
+    # identity projections over cached embeddings, followed by the exact DOTS
+    # target-difficulty softmax sampler.
+    fallback_predictor: identity_attention
+
+    # Reward-extra field for selector labels.  "reward" uses reward_tensor;
+    # "acc" uses reward_extra_info["acc"] when the verifier exposes it.
+    selection_reward_key: reward
+
     # Whether to use replay buffer
     use_replay: false
 
     # Replay buffer weight
     replay_sigma: 1.0
+
+  # VADE-specific settings (used when method=vade)
+  vade:
+
+    # VADE initialization from base-policy rollouts.  Accepts the original
+    # VADE JSON dict format or our dumped JSONL rollout directory/files.
+    initial_rollout_data_path: null
+
+    # Optional directory for per-step VADE a/b state logs.
+    log_state_dir: null
+
+    # VADE sampler hyperparameters.
+    T: 1.0
+    lam1: 0.2
+    lam2: 0.999
+    G: 8
+    replacement: false
+    sample_method: thompson
+    p_function: 1
+    alpha: 0.95
+    seed: 42
+    a_b_update_strategy: 1
+    tau: 1.0
+    k: 100.0
+
+    # Reward-extra field used as rollout correctness.  For ViRL39K/VLAA,
+    # "acc" matches VADE's correct_count semantics.
+    selection_reward_key: acc
+    correctness_threshold: 0.5
 
 # config for the trainer
 trainer:

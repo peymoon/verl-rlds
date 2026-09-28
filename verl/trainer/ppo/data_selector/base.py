@@ -20,6 +20,7 @@ class DataSelectionConfig:
     """Top-level config for data selection, shared by all methods."""
 
     method: str = "none"
+    seed: int = 42
     # "epoch": reselect_interval = every N epochs (at epoch start).
     # "step": reselect_interval = every N training steps (mid-epoch ok; dataloader iterator is refreshed).
     reselect_schedule: str = "epoch"
@@ -29,7 +30,7 @@ class DataSelectionConfig:
 
     # Cap on cumulative unique samples seen over the entire run.
     # When set, the selector freezes the pool once the union of all selected
-    # samples reaches this percentage of the full dataset.  After freeze:
+    # samples reaches this percentage of the selectable dataset.  After freeze:
     #   - Reference and exploration rollouts are skipped (saves compute)
     #   - Training-batch rollout rewards continue accumulating (if use_rollout_history)
     #   - Periodic reselection rounds reweight within the frozen pool based on
@@ -37,9 +38,14 @@ class DataSelectionConfig:
     # Set equal to selection_budget_pct for a fair comparison with a fixed
     # random baseline (e.g., both at 10% → exactly 10% unique samples).
     global_budget_pct: Optional[float] = None
+    # Optional absolute cap. When set, this takes precedence over
+    # global_budget_pct so methods can match a source-corpus budget even when
+    # the selectable training split is smaller than that source corpus.
+    global_budget_count: Optional[int] = None
 
     cluster: dict = field(default_factory=dict)
     dots: dict = field(default_factory=dict)
+    vade: dict = field(default_factory=dict)
 
 
 class DataSelector(ABC):
@@ -56,6 +62,11 @@ class DataSelector(ABC):
         self.config = config
         self._step_count = 0
         self._selection_frozen = False
+        # Exact dataset-index sequence returned by the most recent select().
+        # Order and duplicates are semantically meaningful (frozen-pool
+        # reweighting samples with replacement), so checkpoint restoration must
+        # never reconstruct this from a set or from the cumulative frozen pool.
+        self._last_selected_indices: List[int] = []
         # Minimum number of training samples the trainer must receive per
         # selection round, regardless of per-round annotation budget. The
         # trainer sets this to `train_batch_size` so that a dataloader
@@ -145,6 +156,19 @@ class DataSelector(ABC):
         if self.config.selection_budget is not None:
             return min(self.config.selection_budget, dataset_size)
         return max(1, int(dataset_size * self.config.selection_budget_pct / 100.0))
+
+    def get_current_training_indices(self) -> Optional[List[int]]:
+        """Return the exact active training-loader index sequence, if known.
+
+        A defensive copy is returned deliberately: callers must preserve order
+        and duplicate entries while rebuilding ``Subset`` on checkpoint resume.
+        ``None`` means that the selector state is not sufficient for an exact
+        resume (for example, a legacy checkpoint that did not save this field).
+        """
+        indices = getattr(self, "_last_selected_indices", None)
+        if not indices:
+            return None
+        return [int(i) for i in indices]
 
     def get_metrics(self) -> Dict[str, float]:
         """Return metrics about the last selection for logging."""

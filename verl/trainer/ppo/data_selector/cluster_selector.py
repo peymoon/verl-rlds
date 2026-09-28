@@ -226,25 +226,17 @@ class ClusterSelectorConfig:
     # Saves a substantial amount of inference compute per round.
     reroll_medoids: bool = False
 
-    # Path to the JSONL/JSON source file that was used to build the cluster
-    # embeddings (e.g. VLAA-Thinking-GRPO-25K_train_90_100.json).  Required
-    # when the cluster_arrays.npz was built from this JSON file and the
-    # training parquet has a *different* row ordering — which is the common
-    # case when the parquet was produced via a separate conversion pipeline.
-    # When provided, initialize() builds a bidirectional npz↔parquet alignment
-    # map so that:
-    #   - REPR rollouts reference the correct parquet rows
-    #   - select() returns correct parquet indices for _rebuild_dataloader
-    #   - update_rollout_history() stores rewards at the right NPZ positions
-    # If not provided and the orderings differ, selection is silently incorrect.
+    # JSONL/JSON source used to build the cluster artifact. Required for an
+    # exact, unique qid bijection between NPZ rows and training-parquet rows.
+    # initialize() fails closed on missing/duplicate IDs, length mismatches, or
+    # any unmatched row; positional and image-name fallbacks are forbidden.
     dataset_json_file: Optional[str] = None
 
-    # --- Variance normalization ---
-    # When True, normalize per-sample variance by mean*(1-mean) so that
-    # binary-reward tasks (math/mcq/digit, max raw var = 0.25) and
-    # continuous-reward tasks (IoU grounding, typically much lower raw var)
-    # are scored on a comparable [0, 1] scale.  A value of 1.0 means
-    # "maximally uncertain given the observed mean reward."
+    # --- Variance scaling ---
+    # When True, divide raw variance by the fixed Bernoulli maximum 0.25:
+    # min(4 * variance, 1). For binary rewards this yields 4*p*(1-p), preserving
+    # graded uncertainty (0 for unanimous outcomes, 1 at p=0.5) instead of
+    # collapsing every non-unanimous rollout group to 1.
     normalize_variance: bool = True
 
     # Reward-extra field used by the selector for reference/training rollout
@@ -341,8 +333,9 @@ class ClusterSelector(DataSelector):
 
         # --- Annotation budget tracking ---
         # _ever_selected_set is the union of EVERY sample for which the trainer
-        # has consumed ground-truth (rollout reward computation).  It is the
-        # quantity that the global_budget_pct cap is enforced against.  Three
+        # has consumed ground-truth (rollout reward computation).  It is used
+        # for coverage/frozen-pool accounting; the global_budget_pct cap may
+        # exclude medoid-only probes through _budget_counted_set().  Three
         # disjoint sources contribute, tracked separately so we can report a
         # per-source breakdown to wandb:
         #   training    — samples returned from select() and trained on
@@ -417,7 +410,7 @@ class ClusterSelector(DataSelector):
         # NPZ indices of the frozen pool (set when global budget cap triggers).
         self._frozen_pool_npz: Optional[List[int]] = None
 
-        self._rng = np.random.RandomState(42)
+        self._rng = np.random.RandomState(int(config.seed))
 
         # Variance predictor (KNN / Ridge / MLP)
         self._predictor: VariancePredictor = build_predictor(self.cluster_config)
@@ -439,6 +432,35 @@ class ClusterSelector(DataSelector):
             return set(self._ever_selected_set)
         return set(self._ever_selected_train) | set(self._ever_selected_exploration)
 
+    def _global_budget_max(self) -> Optional[int]:
+        """Return the exact unique-prompt cap, preferring an absolute count."""
+        n_embeddings = (
+            len(self._embeddings)
+            if self._embeddings is not None
+            else self._dataset_size
+        )
+        count = self.config.global_budget_count
+        if count is not None:
+            count = int(count)
+            if count < 1 or count > n_embeddings:
+                raise ValueError(
+                    "global_budget_count must be between 1 and the selectable "
+                    f"dataset size ({n_embeddings}), got {count}."
+                )
+            return count
+        if self.config.global_budget_pct is None:
+            return None
+        return max(
+            1, int(n_embeddings * self.config.global_budget_pct / 100.0)
+        )
+
+    def _remaining_global_budget(self) -> Optional[int]:
+        """Return remaining unique prompts under the global cap, if configured."""
+        global_max = self._global_budget_max()
+        if global_max is None:
+            return None
+        return max(0, global_max - len(self._budget_counted_set()))
+
     def _get_current_phase(self):
         """Return (per_round_pct, interval) for the active budget phase.
 
@@ -453,13 +475,9 @@ class ClusterSelector(DataSelector):
         n_used = len(self._budget_counted_set())
 
         # Global max from config
-        n_embeddings = len(self._embeddings) if self._embeddings is not None else self._dataset_size
-        global_budget_pct = self.config.global_budget_pct
-        if global_budget_pct is None:
-            # No global cap — schedule doesn't apply
-            return (self.config.selection_budget_pct, self.config.reselect_interval)
-        global_max = int(n_embeddings * global_budget_pct / 100.0)
-        if global_max <= 0:
+        global_max = self._global_budget_max()
+        if global_max is None:
+            # No global cap -- schedule does not apply.
             return (self.config.selection_budget_pct, self.config.reselect_interval)
 
         current_pct = (n_used / global_max) * 100.0
@@ -509,6 +527,9 @@ class ClusterSelector(DataSelector):
         arrays, alignment maps) is always reloaded from disk on resume.
         """
         return {
+            "state_version": 2,
+            "_dataset_size": self._dataset_size,
+            "_last_selected_indices": list(self._last_selected_indices),
             # Base class
             "_step_count": self._step_count,
             "_selection_frozen": self._selection_frozen,
@@ -548,6 +569,15 @@ class ClusterSelector(DataSelector):
         Called after initialize() so that static data (embeddings,
         alignment maps) is already loaded before we restore runtime state.
         """
+        saved_size = state.get("_dataset_size")
+        if saved_size is not None and int(saved_size) != self._dataset_size:
+            raise RuntimeError(
+                "ClusterSelector checkpoint dataset size mismatch: "
+                f"checkpoint={int(saved_size)}, current={self._dataset_size}."
+            )
+        self._last_selected_indices = [
+            int(i) for i in state.get("_last_selected_indices", [])
+        ]
         self._step_count = state["_step_count"]
         self._selection_frozen = state["_selection_frozen"]
 
@@ -603,21 +633,28 @@ class ClusterSelector(DataSelector):
                 "embeddings_file to be specified in config"
             )
 
-        # Build NPZ↔parquet alignment map from the source JSON if provided.
-        # This is required when the cluster_arrays.npz was built from a JSON file
-        # whose row ordering differs from the training parquet row ordering.
-        if self.cluster_config.dataset_json_file:
-            self._build_alignment_from_json(dataset, self.cluster_config.dataset_json_file)
-        else:
-            print("[ClusterSelector] WARNING: dataset_json_file not set. "
-                  "Assuming NPZ row order == parquet row order. If they differ, "
-                  "REPR rollouts and select() will reference wrong parquet rows. "
-                  "Set data_selection.cluster.dataset_json_file to the JSON source "
-                  "used to build the embeddings.")
+        # Selection must be content-aligned; positional assumptions silently
+        # corrupted historical runs and are not scientifically resumable.
+        if not self.cluster_config.dataset_json_file:
+            raise RuntimeError(
+                "ClusterSelector requires cluster.dataset_json_file for qid alignment."
+            )
+        self._build_alignment_from_json(dataset, self.cluster_config.dataset_json_file)
 
         self._load_vdr_static_prior()
         self._load_cava_static_prior()
         self._select_representatives()
+        if (
+            self.cluster_config.count_medoids_in_budget
+            and self._global_budget_max() is not None
+        ):
+            remaining = self._remaining_global_budget()
+            if remaining is not None and len(set(self._rep_indices)) > remaining:
+                raise ValueError(
+                    "Representative probes exceed the global unique-prompt budget: "
+                    f"representatives={len(set(self._rep_indices))}, budget={remaining}. "
+                    "Reduce n_clusters/n_reps or increase the global budget cap."
+                )
 
         if self.cluster_config.strategy in ("scored", "interpolated"):
             self._compute_static_scores()
@@ -659,27 +696,26 @@ class ClusterSelector(DataSelector):
         print(f"[ClusterSelector] Loaded {len(self._embeddings)} embeddings, "
               f"{self._centroids.shape[0]} centroids, {n_active} active clusters")
 
+        if len(self._embeddings) != len(self._cluster_ids):
+            raise ValueError(
+                "cluster_arrays.npz is inconsistent: embeddings and assignments "
+                f"have lengths {len(self._embeddings)} and {len(self._cluster_ids)}."
+            )
         if len(self._embeddings) != self._dataset_size:
-            print(f"[ClusterSelector] WARNING: embeddings size ({len(self._embeddings)}) "
-                  f"!= dataset size ({self._dataset_size}). Using min.")
-            min_size = min(len(self._embeddings), self._dataset_size)
-            self._embeddings = self._embeddings[:min_size]
-            self._cluster_ids = self._cluster_ids[:min_size]
+            raise ValueError(
+                "Cluster artifacts must be built for the exact training split: "
+                f"embeddings={len(self._embeddings)}, dataset={self._dataset_size}."
+            )
 
-        if self.cluster_config.use_rollout_history:
-            if "uids" in data:
-                raw_uids = data["uids"]
-                self._uid_to_dataset_idx = {
-                    str(u): i for i, u in enumerate(raw_uids)
-                    if i < len(self._embeddings)
-                }
-                print(f"[ClusterSelector] Built UID→idx map: "
-                      f"{len(self._uid_to_dataset_idx)} entries")
-            else:
-                print("[ClusterSelector] WARNING: use_rollout_history=True but "
-                      "cluster_arrays.npz has no 'uids' field — training-batch rollouts "
-                      "will NOT be accumulated. Re-run Stage 1 (01_cluster.py) to "
-                      "regenerate cluster_arrays.npz with the uids field.")
+        if "uids" not in data:
+            raise ValueError(
+                "cluster_arrays.npz must contain stable 'uids' for qid alignment."
+            )
+        raw_uids = [str(u) for u in data["uids"]]
+        if len(raw_uids) != len(self._embeddings) or len(set(raw_uids)) != len(raw_uids):
+            raise ValueError("cluster_arrays.npz uids must be unique and match embeddings length.")
+        self._uid_to_dataset_idx = {uid: i for i, uid in enumerate(raw_uids)}
+        print(f"[ClusterSelector] Built UID→idx map: {len(self._uid_to_dataset_idx)} entries")
 
     def _load_embeddings_and_cluster(self) -> None:
         """Load embeddings from file and run FAISS clustering."""
@@ -689,10 +725,10 @@ class ClusterSelector(DataSelector):
         self._embeddings = data["embeddings"].astype(np.float32)
 
         if len(self._embeddings) != self._dataset_size:
-            print(f"[ClusterSelector] WARNING: embeddings ({len(self._embeddings)}) "
-                  f"!= dataset ({self._dataset_size})")
-            min_size = min(len(self._embeddings), self._dataset_size)
-            self._embeddings = self._embeddings[:min_size]
+            raise ValueError(
+                "Embedding artifacts must be built for the exact training split: "
+                f"embeddings={len(self._embeddings)}, dataset={self._dataset_size}."
+            )
 
         print(f"[ClusterSelector] Running FAISS spherical KMeans "
               f"(K={self.cluster_config.n_clusters})...")
@@ -722,134 +758,126 @@ class ClusterSelector(DataSelector):
         print(f"[ClusterSelector] Clustering complete: "
               f"{len(np.unique(self._cluster_ids))} active clusters")
 
-        # Build UID→idx map from embeddings file if UIDs are stored there.
-        if self.cluster_config.use_rollout_history:
-            for key in ("uids", "ids"):
-                if key in data:
-                    raw_uids = data[key]
-                    self._uid_to_dataset_idx = {
-                        str(u): i for i, u in enumerate(raw_uids)
-                        if i < len(self._embeddings)
-                    }
-                    print(f"[ClusterSelector] Built UID→idx map from embeddings file "
-                          f"(key='{key}'): {len(self._uid_to_dataset_idx)} entries")
-                    break
-            else:
-                print("[ClusterSelector] WARNING: use_rollout_history=True but embeddings "
-                      "file has no 'uids'/'ids' field — training-batch rollouts will NOT "
-                      "be accumulated. Use cluster_arrays_file instead of embeddings_file, "
-                      "or run Stage 1 (01_cluster.py) to produce cluster_arrays.npz.")
+        # Stable UIDs are required for content-safe alignment, independently of
+        # whether rollout history is enabled.
+        for key in ("uids", "ids"):
+            if key in data:
+                raw_uids = [str(u) for u in data[key]]
+                if len(raw_uids) != len(self._embeddings) or len(set(raw_uids)) != len(raw_uids):
+                    raise ValueError("Embedding uids must be unique and match embeddings length.")
+                self._uid_to_dataset_idx = {uid: i for i, uid in enumerate(raw_uids)}
+                break
+        else:
+            raise ValueError("Embedding file must contain stable 'uids' or 'ids'.")
 
     def _build_alignment_from_json(self, dataset, json_path: str) -> None:
-        """Build npz↔parquet index alignment maps.
+        """Build an exact NPZ-to-training-row qid bijection.
 
-        Produces:
-            _npz_to_dataset[npz_i]   = parquet_i   (shape N_npz, fill -1 if no match)
-            _dataset_to_npz[parquet_i] = npz_i     (only for matched rows)
-
-        Strategy (in priority order):
-        1. **QID-based** (preferred): if the NPZ has a 'uids' array of qids AND the
-           parquet stores 'qid' in extra_info, match directly on qid.  This is
-           content-based and immune to differences in row ordering between the JSON
-           source file (e.g. all.jsonl) and the file the NPZ was actually built from
-           (e.g. train_90_100.jsonl).
-        2. **Image-path-based via JSONL**: for each NPZ row, look up the qid in the
-           JSON source to get the image path, then match against extra_info['image']
-           in the parquet.  Handles cases where the parquet has no 'qid' field.
-        3. **Positional fallback** (legacy): assume JSONL row i == NPZ row i.  Only
-           correct when the JSONL and NPZ share the exact same row ordering.
-
-        Once built, get_reference_indices() and select() remap their NPZ-order
-        outputs to parquet-order indices via _npz_to_dataset.
+        The cluster artifact, its source JSON/JSONL, and the filtered training
+        dataset must contain the same number of unique, non-empty qids. Any
+        mismatch fails closed; positional and image-name fallbacks are unsafe.
         """
         import json as _json
 
-        print(f"[ClusterSelector] Building NPZ↔parquet alignment from {json_path} ...")
-
+        print(f"[ClusterSelector] Building NPZ-to-parquet alignment from {json_path} ...")
         n_npz = len(self._embeddings)
 
-        # --- Step 1: scan parquet once to build lookup maps ---
-        parquet_img_to_idx: Dict[str, int] = {}   # image_path  → parquet_i
-        parquet_qid_to_idx: Dict[str, int] = {}   # qid string  → parquet_i
+        parquet_qid_to_idx: Dict[str, int] = {}
         for parquet_i in range(len(dataset)):
             try:
-                item = dataset.dataframe[parquet_i]  # direct pandas access, no preprocessing
+                item = dataset.dataframe[parquet_i]
             except Exception:
                 try:
                     item = dataset[parquet_i]
-                except Exception:
-                    continue
-            ei = item.get("extra_info") or {}
-            img = ei.get("image", "")
-            qid = str(ei.get("qid", ""))
-            if img:
-                parquet_img_to_idx[img] = parquet_i
-            if qid:
-                parquet_qid_to_idx[qid] = parquet_i
+                except Exception as exc:
+                    raise ValueError(
+                        f"Could not read training row {parquet_i} for qid alignment"
+                    ) from exc
+            extra_info = item.get("extra_info") or {}
+            qid = str(extra_info.get("qid", "")).strip()
+            if not qid:
+                raise ValueError(
+                    f"Training row {parquet_i} has no non-empty extra_info.qid"
+                )
+            if qid in parquet_qid_to_idx:
+                raise ValueError(f"Duplicate parquet qid encountered: {qid}")
+            parquet_qid_to_idx[qid] = parquet_i
 
-        # --- Step 2: load JSON records, building {qid: image_path} lookup ---
-        # We read the full JSONL regardless of strategy so we have the image paths
-        # available for the image-path fallback.  'image_rel' (new dataset_prep
-        # pipeline) and 'image' (legacy VLAA-style) are both supported.
-        json_qid_to_img: Dict[str, str] = {}      # qid → image path (from JSONL)
-        json_image_paths_positional: List[str] = []  # for legacy positional fallback
-        with open(json_path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = _json.loads(line)
-                    img = rec.get("image", "") or rec.get("image_rel", "")
-                    qid = str(rec.get("qid", ""))
-                    if qid:
-                        json_qid_to_img[qid] = img
-                    json_image_paths_positional.append(img)
-                except _json.JSONDecodeError:
-                    json_image_paths_positional.append("")
+        with open(json_path, encoding="utf-8") as handle:
+            first = ""
+            while True:
+                char = handle.read(1)
+                if not char:
+                    break
+                if not char.isspace():
+                    first = char
+                    break
+            handle.seek(0)
+            if first == "[":
+                records = _json.load(handle)
+                if not isinstance(records, list):
+                    raise ValueError("Cluster source JSON must contain a list of records")
+            else:
+                records = []
+                for line_number, line in enumerate(handle, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(_json.loads(line))
+                    except _json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"Invalid JSONL at {json_path}:{line_number}: {exc}"
+                        ) from exc
 
-        json_image_paths_positional = json_image_paths_positional[:n_npz]
+        json_qids: set[str] = set()
+        for row_number, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ValueError(f"Cluster source row {row_number} is not an object")
+            qid = str(record.get("qid", "")).strip()
+            if not qid:
+                raise ValueError(f"Cluster source row {row_number} has no qid")
+            if qid in json_qids:
+                raise ValueError(f"Duplicate cluster-source qid encountered: {qid}")
+            json_qids.add(qid)
 
-        # --- Step 3: build alignment ---
+        npz_qids = set(self._uid_to_dataset_idx)
+        if json_qids != npz_qids:
+            missing = sorted(npz_qids - json_qids)[:5]
+            extra = sorted(json_qids - npz_qids)[:5]
+            raise ValueError(
+                "Cluster source qids do not match artifact uids: "
+                f"json={len(json_qids)}, artifact={len(npz_qids)}, "
+                f"missing_examples={missing}, extra_examples={extra}"
+            )
+
         self._npz_to_dataset = np.full(n_npz, -1, dtype=np.int64)
         self._dataset_to_npz = {}
-        n_matched = 0
+        for qid, npz_idx in self._uid_to_dataset_idx.items():
+            parquet_i = parquet_qid_to_idx.get(qid)
+            if parquet_i is None:
+                continue
+            self._npz_to_dataset[npz_idx] = parquet_i
+            self._dataset_to_npz[parquet_i] = npz_idx
 
-        if self._uid_to_dataset_idx and parquet_qid_to_idx:
-            # Strategy 1: QID-based — content-safe, ordering-independent.
-            # _uid_to_dataset_idx = {qid: npz_idx} (built from NPZ 'uids' in
-            # _load_precomputed_clusters / _load_embeddings_and_cluster).
-            for qid, npz_idx in self._uid_to_dataset_idx.items():
-                if npz_idx >= n_npz:
-                    continue
-                parquet_i = parquet_qid_to_idx.get(qid, -1)
-                if parquet_i < 0 and json_qid_to_img:
-                    # Try image-path fallback for this qid (Strategy 2).
-                    img = json_qid_to_img.get(qid, "")
-                    if img:
-                        parquet_i = parquet_img_to_idx.get(img, -1)
-                self._npz_to_dataset[npz_idx] = parquet_i
-                if parquet_i >= 0:
-                    self._dataset_to_npz[parquet_i] = npz_idx
-                    n_matched += 1
-            method = "qid"
-        elif json_image_paths_positional and parquet_img_to_idx:
-            # Strategy 3: positional fallback — only correct when JSONL and NPZ
-            # share the exact same row ordering.
-            for npz_i, img_path in enumerate(json_image_paths_positional):
-                parquet_i = parquet_img_to_idx.get(img_path, -1)
-                self._npz_to_dataset[npz_i] = parquet_i
-                if parquet_i >= 0:
-                    self._dataset_to_npz[parquet_i] = npz_i
-                    n_matched += 1
-            method = "positional-image-path"
-        else:
-            method = "none"
-
-        n_unmatched = n_npz - n_matched
-        print(f"[ClusterSelector] Alignment ({method}): {n_matched}/{n_npz} NPZ rows matched "
-              f"to parquet rows ({n_unmatched} unmatched — typically test-set samples "
-              f"not present in the training parquet).")
+        n_matched = len(self._dataset_to_npz)
+        if (
+            n_matched != n_npz
+            or n_matched != len(dataset)
+            or len(json_qids) != n_npz
+        ):
+            missing = sorted(npz_qids - set(parquet_qid_to_idx))[:5]
+            extra = sorted(set(parquet_qid_to_idx) - npz_qids)[:5]
+            raise ValueError(
+                "Cluster artifact/source/training split do not form an exact qid "
+                f"bijection: matched={n_matched}, embeddings={n_npz}, "
+                f"json={len(json_qids)}, dataset={len(dataset)}, "
+                f"missing_examples={missing}, extra_examples={extra}"
+            )
+        print(
+            f"[ClusterSelector] Alignment (qid): exact {n_matched}/{n_npz} "
+            "artifact/source/training bijection"
+        )
 
     def _remap_npz_to_dataset(self, npz_indices: List[int]) -> List[int]:
         """Map NPZ positions → parquet positions, dropping any without a match."""
@@ -1495,20 +1523,28 @@ class ClusterSelector(DataSelector):
         """
         result = self._fit_predict_cached()
         if result is None:
-            return self._remap_npz_to_dataset(self._rep_indices)
+            return []
 
         if result.uncertainty is None:
             return []
 
         n_probes = len(self._rep_indices)
+        if self.cluster_config.count_medoids_in_budget:
+            remaining = self._remaining_global_budget()
+            if remaining is not None:
+                n_probes = min(n_probes, remaining)
+        if n_probes <= 0:
+            return []
+
         utility = result.predicted_var.copy()
         sigma = result.uncertainty
 
         beta = self.cluster_config.predictor_ucb_beta
         acq = utility + beta * sigma
 
-        # Exclude already-selected samples from probing
-        exclude = self._discovery_exclude_set()
+        # Active probes must be new observations, regardless of whether fixed
+        # medoids count against the configured training-data budget.
+        exclude = self._ever_selected_set
         if exclude:
             ever = np.fromiter(exclude, dtype=np.int64, count=len(exclude))
             ever = ever[(ever >= 0) & (ever < len(acq))]
@@ -1582,11 +1618,10 @@ class ClusterSelector(DataSelector):
             c_id = int(self._cluster_ids[global_idx])
             mean_r = float(ref_rewards[i].mean())
             var_r = float(ref_rewards[i].var())
-            # Normalize variance by mean*(1-mean) so binary and continuous
-            # rewards are comparable.  A score of 1.0 = maximum uncertainty.
+            # Scale by the fixed Bernoulli maximum (0.25), preserving graded
+            # uncertainty: min(4 * variance, 1).
             if self.cluster_config.normalize_variance:
-                denom = max(mean_r * (1.0 - mean_r), 1e-8)
-                var_r = min(var_r / denom, 1.0)
+                var_r = min(4.0 * var_r, 1.0)
             self._rep_variances[global_idx] = var_r  # individual variance per rep
             self._rep_mean_rewards[global_idx] = mean_r  # individual mean reward per rep
             self._rep_reward_rows[global_idx] = ref_rewards[i].copy()
@@ -1603,12 +1638,19 @@ class ClusterSelector(DataSelector):
                     (self._current_training_step, ref_rewards[i].copy())
                 )
 
-        # Track medoid rollouts separately from training/exploration budget.
-        # They count only when count_medoids_in_budget=True.
+        # Track medoid rollouts as first-observation annotations. Source
+        # buckets are disjoint: if a sample has already been seen via another
+        # source, do not rebucket it as a medoid.
         if medoid_npz_used:
-            new_medoid = set(medoid_npz_used) - self._ever_selected_medoid
+            new_medoid = set(medoid_npz_used) - self._ever_selected_set
+            if self.cluster_config.count_medoids_in_budget:
+                remaining = self._remaining_global_budget()
+                if remaining is not None and len(new_medoid) > remaining:
+                    raise RuntimeError(
+                        "Reference probes would exceed the global unique-prompt budget."
+                    )
             self._ever_selected_medoid |= new_medoid
-            self._ever_selected_set |= set(medoid_npz_used)
+            self._ever_selected_set |= new_medoid
 
         self._cluster_variances = {}
         self._cluster_mean_rewards = {}
@@ -1757,11 +1799,9 @@ class ClusterSelector(DataSelector):
             for t, rewards in history:
                 w = float(np.exp(-decay * max(0, current_step - t)))
                 v = float(np.var(rewards)) if len(rewards) > 1 else 0.0
-                # Normalize variance by mean*(1-mean) for cross-task comparability
+                # Scale by the fixed Bernoulli maximum while retaining magnitude.
                 if self.cluster_config.normalize_variance and len(rewards) > 1:
-                    m = float(np.mean(rewards))
-                    denom = max(m * (1.0 - m), 1e-8)
-                    v = min(v / denom, 1.0)
+                    v = min(4.0 * v, 1.0)
                 weighted_var += w * v
                 total_w += w
                 latest_step = max(latest_step, t)
@@ -1962,15 +2002,7 @@ class ClusterSelector(DataSelector):
     # ------------------------------------------------------------------
 
     def get_exploration_indices(self) -> List[int]:
-        """Return random un-selected sample indices for exploration rollouts.
-
-        Called by the trainer alongside get_reference_indices() when
-        exploration is enabled and this is an exploration round.  The
-        returned indices are rolled out and fed back via
-        update_exploration_rewards().
-
-        Returns parquet-order indices (like get_reference_indices).
-        """
+        """Return new, globally budgeted random indices for exploration."""
         if self._selection_frozen:
             return []
         if not self.cluster_config.exploration_enabled:
@@ -1979,24 +2011,30 @@ class ClusterSelector(DataSelector):
             return []
 
         budget = self.get_selection_budget_for_exploration()
+        remaining = self._remaining_global_budget()
+        if remaining is not None:
+            budget = min(budget, remaining)
         if budget <= 0:
             return []
 
-        # Pick samples NOT in the current selection to break the feedback loop
-        all_indices = set(range(len(self._embeddings)))
-        selected_set = self._prev_selected_set if self._prev_selected_set else set()
-        candidates = list(all_indices - selected_set)
-
-        if len(candidates) == 0:
-            candidates = list(all_indices)
+        # Exploration is an annotation event, so choose only prompts that have
+        # never been observed by any source. Re-probing an old row would spend
+        # rollout compute without expanding coverage.
+        candidates = sorted(set(range(len(self._embeddings))) - self._ever_selected_set)
+        if not candidates:
+            return []
 
         n_explore = min(budget, len(candidates))
-        explore_npz = self._rng.choice(candidates, size=n_explore, replace=False).tolist()
+        explore_npz = self._rng.choice(
+            candidates, size=n_explore, replace=False
+        ).tolist()
         self._exploration_indices = explore_npz
 
         parquet_indices = self._remap_npz_to_dataset(explore_npz)
-        print(f"[ClusterSelector] Exploration: {len(parquet_indices)} random "
-              f"un-selected samples for rollout (round={self._selection_round})")
+        print(
+            f"[ClusterSelector] Exploration: {len(parquet_indices)} new random "
+            f"samples for rollout (round={self._selection_round})"
+        )
         return parquet_indices
 
     def get_selection_budget_for_exploration(self) -> int:
@@ -2018,44 +2056,47 @@ class ClusterSelector(DataSelector):
     def update_exploration_rewards(
         self, explore_indices: List[int], explore_rewards: np.ndarray
     ) -> None:
-        """Feed exploration rollout results into the history buffer.
-
-        Args:
-            explore_indices: parquet-order indices that were rolled out
-            explore_rewards: (n_explore, n_rollouts) reward array
-        """
+        """Account exploration labels and optionally add them to history."""
         if not self.cluster_config.exploration_enabled:
-            return
-        if not self.cluster_config.use_rollout_history:
             return
 
         explore_rewards = np.asarray(explore_rewards)
         if explore_rewards.ndim == 1:
             explore_rewards = explore_rewards.reshape(-1, 1)
+        if len(explore_rewards) != len(explore_indices):
+            raise ValueError(
+                "Exploration index/reward length mismatch: "
+                f"indices={len(explore_indices)}, rewards={len(explore_rewards)}"
+            )
 
-        n_added = 0
         explore_npz_used: List[int] = []
         for i, parquet_idx in enumerate(explore_indices):
-            npz_idx = (self._dataset_to_npz.get(int(parquet_idx), -1)
-                       if self._dataset_to_npz is not None else parquet_idx)
-            if npz_idx < 0:
-                continue
-            if npz_idx not in self._rollout_buffer:
-                self._rollout_buffer[npz_idx] = []
-            self._rollout_buffer[npz_idx].append(
-                (self._current_training_step, explore_rewards[i].copy())
+            npz_idx = (
+                self._dataset_to_npz.get(int(parquet_idx), -1)
+                if self._dataset_to_npz is not None
+                else int(parquet_idx)
             )
-            n_added += 1
+            if npz_idx < 0 or npz_idx >= len(self._embeddings):
+                continue
             explore_npz_used.append(int(npz_idx))
+            if self.cluster_config.use_rollout_history:
+                self._rollout_buffer.setdefault(npz_idx, []).append(
+                    (self._current_training_step, explore_rewards[i].copy())
+                )
 
-        # Account exploration rollouts against the global annotation budget.
-        if explore_npz_used:
-            new_explore = set(explore_npz_used) - self._ever_selected_exploration
-            self._ever_selected_exploration |= new_explore
-            self._ever_selected_set |= set(explore_npz_used)
+        new_explore = set(explore_npz_used) - self._ever_selected_set
+        remaining = self._remaining_global_budget()
+        if remaining is not None and len(new_explore) > remaining:
+            raise RuntimeError(
+                "Exploration rewards would exceed the global unique-prompt budget."
+            )
+        self._ever_selected_exploration |= new_explore
+        self._ever_selected_set |= new_explore
 
-        print(f"[ClusterSelector] Exploration: added {n_added} samples to history buffer "
-              f"({len(explore_npz_used)} new uniques counted against global budget)")
+        print(
+            f"[ClusterSelector] Exploration: accounted {len(explore_npz_used)} "
+            f"rollouts ({len(new_explore)} new unique prompts)"
+        )
 
     # ------------------------------------------------------------------
     # Image Grounding Score (IGS)
@@ -2138,6 +2179,19 @@ class ClusterSelector(DataSelector):
 
     def select(self, budget: int) -> List[int]:
         self._selection_round += 1
+        budget = max(0, int(budget))
+
+        # Clip discovery to the remaining unique-prompt budget before choosing
+        # candidates. This prevents the last discovery round from overshooting.
+        global_max = self._global_budget_max()
+        if global_max is not None and not self._selection_frozen:
+            remaining = global_max - len(self._budget_counted_set())
+            if remaining <= 0:
+                self._selection_frozen = True
+                self._frozen_pool_npz = sorted(self._ever_selected_set)
+                budget = max(len(self._frozen_pool_npz), self._min_training_pool_size)
+            else:
+                budget = min(budget, remaining)
 
         was_frozen = self._selection_frozen
         if was_frozen:
@@ -2157,11 +2211,10 @@ class ClusterSelector(DataSelector):
             has_sample_signal = bool(self._rollout_buffer) or bool(self._rep_reward_rows)
             if not has_cluster_signal and not (strategy == "interpolated" and has_sample_signal):
                 print("[ClusterSelector] No variance data yet, selecting random")
-                return self._rng.choice(
+                npz_indices = self._rng.choice(
                     self._dataset_size, size=min(budget, self._dataset_size), replace=False
                 ).tolist()
-
-            if strategy == "top_clusters":
+            elif strategy == "top_clusters":
                 npz_indices = self._select_top_clusters(budget)
             elif strategy == "weighted":
                 npz_indices = self._select_weighted(budget)
@@ -2191,7 +2244,7 @@ class ClusterSelector(DataSelector):
         if len(current_set) > 0:
             n_embeddings = len(self._embeddings)
             if was_frozen:
-                pool = self._frozen_pool_npz or sorted(self._budget_counted_set())
+                pool = self._frozen_pool_npz or sorted(self._ever_selected_set)
                 eligible = np.asarray(pool, dtype=np.int64)
             elif (getattr(self.cluster_config, "exclude_already_selected", True)
                     and self._discovery_exclude_set()):
@@ -2216,10 +2269,12 @@ class ClusterSelector(DataSelector):
 
         self._prev_selected_set = current_set
         self._selection_history.append(current_set)
-        # Account training samples against the global annotation budget.
-        new_train = current_set - self._ever_selected_train
+        # Account training samples as first-observation annotations. Samples
+        # already used as medoid/exploration probes keep their original source
+        # bucket, matching the good K150/r3 run's budget accounting.
+        new_train = current_set - self._ever_selected_set
         self._ever_selected_train |= new_train
-        self._ever_selected_set |= current_set
+        self._ever_selected_set |= new_train
 
         # Track per-cluster selection frequency
         for idx in npz_indices:
@@ -2243,20 +2298,18 @@ class ClusterSelector(DataSelector):
                   f"per_round_pct={per_round_pct}, interval={interval}")
 
         # --- Global budget enforcement ---
-        # When global_budget_pct is set, freeze selection once cumulative unique
-        # samples reach the cap.  By default medoid probes are excluded from
-        # the count (they're measurement cost, not training data).
-        if self.config.global_budget_pct is not None and not was_frozen:
-            global_max = max(1, int(n_embeddings * self.config.global_budget_pct / 100.0))
+        # Freeze selection once budget-counted samples reach the exact cap.
+        # Medoid probes may be excluded from the count, but remain anchors in
+        # the frozen reweight pool for backward-compatible ablations.
+        if global_max is not None and not was_frozen:
             n_budget_used = len(self._budget_counted_set())
             if n_budget_used >= global_max:
                 self._selection_frozen = True
-                self._frozen_pool_npz = sorted(self._budget_counted_set())
+                self._frozen_pool_npz = sorted(self._ever_selected_set)
                 print(f"[ClusterSelector] Global budget cap reached: "
                       f"{n_budget_used} budget samples >= {global_max} "
-                      f"({self.config.global_budget_pct}% of {n_embeddings}, "
-                      f"medoids_in_budget={self.cluster_config.count_medoids_in_budget}). "
-                      f"Pool frozen — subsequent rounds will reweight within "
+                      f"(medoids_in_budget={self.cluster_config.count_medoids_in_budget}). "
+                      f"Pool frozen -- subsequent rounds will reweight within "
                       f"this pool using training reward variance.")
 
         # --- Pad to minimum training-pool size ---
@@ -2264,46 +2317,31 @@ class ClusterSelector(DataSelector):
         # selector wants rolled out; the dataloader, however, needs enough
         # rows to form at least one full batch (drop_last=True).  When the
         # budget schedule tapers per_round_pct below train_batch_size, we
-        # backfill with samples already counted in the training/exploration
-        # budget. These are free — they already have rollout history and have
-        # already been counted against the global annotation budget — so
-        # padding keeps training alive without inflating the annotation cost.
+        # backfill with samples already seen by the selector. These are free:
+        # they already have rollout history and have already been counted in a
+        # source bucket, so padding keeps training alive without inflating the
+        # annotation cost.
         floor = int(self._min_training_pool_size)
         if floor > 0 and len(indices) < floor:
             selected_set = set(indices)
             # Previously annotated parquet indices, minus what we already have.
-            pool_npz = self._budget_counted_set() - set(npz_indices)
+            pool_npz = self._ever_selected_set - set(npz_indices)
             pool_parquet: List[int] = []
             if pool_npz:
                 remapped = self._remap_npz_to_dataset(list(pool_npz))
                 pool_parquet = [p for p in remapped if p not in selected_set]
 
             need = floor - len(indices)
-            if len(pool_parquet) >= need:
-                pad = self._rng.choice(pool_parquet, size=need, replace=False).tolist()
-                source = "pool"
-            elif pool_parquet:
-                pad = list(pool_parquet)
-                source = "pool(exhausted)"
-            else:
-                pad = []
-                source = "none"
-
-            # If the already-annotated pool is still too small (very early
-            # rounds), fall back to random draws from the full parquet
-            # dataset so the trainer always gets a batch.  These extras are
-            # NOT added to _ever_selected_* — they're padding, not new
-            # annotations.
-            remaining = floor - (len(indices) + len(pad))
-            if remaining > 0:
-                full = set(range(self._dataset_size)) - selected_set - set(pad)
-                if full:
-                    extra_n = min(remaining, len(full))
-                    extra = self._rng.choice(
-                        list(full), size=extra_n, replace=False
-                    ).tolist()
-                    pad.extend(extra)
-                    source = source + "+random"
+            # Reuse only already-verified rows. Sampling with replacement is
+            # intentional: it preserves a strict unique-prompt budget while
+            # still satisfying drop_last=True for very small phase budgets.
+            reusable = list(dict.fromkeys(list(indices) + pool_parquet))
+            if not reusable:
+                raise RuntimeError(
+                    "Selection produced no verified rows to build a full training batch."
+                )
+            pad = self._rng.choice(reusable, size=need, replace=True).tolist()
+            source = "verified_pool(replacement)"
 
             if pad:
                 print(f"[ClusterSelector] Padding training pool "
@@ -2348,7 +2386,7 @@ class ClusterSelector(DataSelector):
 
         pool = self._frozen_pool_npz
         if pool is None or len(pool) == 0:
-            pool = sorted(self._budget_counted_set()) or sorted(self._ever_selected_set)
+            pool = sorted(self._ever_selected_set) or sorted(self._budget_counted_set())
         n_pool = len(pool)
 
         if n_pool == 0:
@@ -2634,12 +2672,14 @@ class ClusterSelector(DataSelector):
         # pool — i.e. selection without replacement.  After global_budget_pct
         # is hit, _select_frozen_reweight takes over and is allowed to pick
         # repeats inside the frozen pool.
+        eligible_mask = np.ones(predicted_var.shape[0], dtype=bool)
         exclude = self._discovery_exclude_set() if self.cluster_config.exclude_already_selected else set()
         if exclude:
             mask = np.zeros(predicted_var.shape[0], dtype=bool)
             ever = np.fromiter(exclude, dtype=np.int64, count=len(exclude))
             ever = ever[(ever >= 0) & (ever < mask.shape[0])]
             mask[ever] = True
+            eligible_mask[ever] = False
             n_excluded = int(mask.sum())
             if n_excluded > 0:
                 # Use a copy so we don't mutate any caller-shared array.
@@ -2655,8 +2695,10 @@ class ClusterSelector(DataSelector):
                     return []
 
         if not self.cluster_config.dots_diversity:
-            # Global top-k: pure ranking by predicted variance
-            top_indices = np.argsort(-predicted_var)[:budget]
+            # Rank only explicit eligible candidates; excluded zero-score rows
+            # must never re-enter through argsort tie-breaking.
+            candidates = np.flatnonzero(eligible_mask)
+            top_indices = candidates[np.argsort(-predicted_var[candidates])[:budget]]
             if self.cluster_config.cava_vdr_enabled and cava_gate is not None:
                 self._record_cava_selection_metrics(
                     top_indices.tolist(), utility_before_cava, utility_after_cava, cava_gate
@@ -2670,16 +2712,20 @@ class ClusterSelector(DataSelector):
 
         # Step 1: compute cluster-mean predicted variance for active clusters.
         cluster_pred_var = {}
+        cluster_capacities = {}
         for c_id in range(self._centroids.shape[0]):
-            mask = self._cluster_ids == c_id
-            if not mask.any():
+            mask = (self._cluster_ids == c_id) & eligible_mask
+            capacity = int(mask.sum())
+            if capacity == 0:
                 continue
             cpv = float(predicted_var[mask].mean())
             if cpv > 0:
                 cluster_pred_var[c_id] = cpv
+                cluster_capacities[c_id] = capacity
 
         if not cluster_pred_var:
-            top_indices = np.argsort(-predicted_var)[:budget]
+            candidates = np.flatnonzero(eligible_mask)
+            top_indices = candidates[np.argsort(-predicted_var[candidates])[:budget]]
             if self.cluster_config.vdr_enabled and vdr_gate is not None:
                 self._record_vdr_selection_metrics(top_indices.tolist(), vdr_gate)
             return top_indices.tolist()
@@ -2757,17 +2803,19 @@ class ClusterSelector(DataSelector):
 
         allocations = {}
         for c_id, ratio in zip(c_ids, ratios):
-            cluster_size = int((self._cluster_ids == c_id).sum())
-            allocations[c_id] = min(max(1, int(round(ratio * budget))), cluster_size)
+            capacity = cluster_capacities[c_id]
+            allocations[c_id] = min(max(0, int(round(ratio * budget))), capacity)
 
-        allocations = self._adjust_allocations(allocations, budget, cluster_scores)
+        allocations = self._adjust_allocations(
+            allocations, budget, cluster_scores, capacity_lookup=cluster_capacities
+        )
 
         # Step 5: within each cluster take top-n by predicted variance.
         selected = []
         for c_id, n_take in allocations.items():
             if n_take <= 0:
                 continue
-            cluster_indices = np.where(self._cluster_ids == c_id)[0]
+            cluster_indices = np.where((self._cluster_ids == c_id) & eligible_mask)[0]
             sorted_local = np.argsort(-predicted_var[cluster_indices])[:n_take]
             selected.extend(cluster_indices[sorted_local].tolist())
 
@@ -2892,9 +2940,13 @@ class ClusterSelector(DataSelector):
         allocations: Dict[int, int],
         budget: int,
         score_lookup: Optional[Dict[int, float]] = None,
+        capacity_lookup: Optional[Dict[int, int]] = None,
     ) -> Dict[int, int]:
         """Adjust allocations to match budget exactly."""
         score_lookup = score_lookup or self._cluster_variances
+        capacity_lookup = capacity_lookup or {
+            c: int((self._cluster_ids == c).sum()) for c in allocations
+        }
         total = sum(allocations.values())
         if total > budget:
             sorted_keys = sorted(allocations.keys(),
@@ -2902,7 +2954,7 @@ class ClusterSelector(DataSelector):
             for c_id in sorted_keys:
                 if total <= budget:
                     break
-                reduction = min(allocations[c_id] - 1, total - budget)
+                reduction = min(allocations[c_id], total - budget)
                 if reduction > 0:
                     allocations[c_id] -= reduction
                     total -= reduction
@@ -2913,7 +2965,7 @@ class ClusterSelector(DataSelector):
             for c_id in sorted_keys:
                 if total >= budget:
                     break
-                cluster_size = int((self._cluster_ids == c_id).sum())
+                cluster_size = int(capacity_lookup.get(c_id, 0))
                 can_add = cluster_size - allocations[c_id]
                 add = min(can_add, budget - total)
                 if add > 0:
@@ -2983,8 +3035,8 @@ class ClusterSelector(DataSelector):
                 100.0 * len(self._ever_selected_exploration) / n_total)
 
             # Report global budget cap utilization if enabled
-            if self.config.global_budget_pct is not None:
-                global_max = max(1, int(len(self._embeddings) * self.config.global_budget_pct / 100.0))
+            global_max = self._global_budget_max()
+            if global_max is not None:
                 metrics["data_selection/global_budget"] = float(global_max)
                 n_budget_used = len(self._budget_counted_set())
                 metrics["data_selection/global_budget_utilization_pct"] = (
@@ -3000,7 +3052,7 @@ class ClusterSelector(DataSelector):
                 # Reweight stats: predicted variance within the frozen pool
                 if (self._selection_frozen
                         and self._last_predicted_var is not None):
-                    pool = self._frozen_pool_npz or sorted(self._budget_counted_set())
+                    pool = self._frozen_pool_npz or sorted(self._ever_selected_set)
                     pool_arr = np.array(pool)
                     if len(pool_arr) > 0:
                         pv = self._last_predicted_var[pool_arr]
@@ -3285,12 +3337,11 @@ class ClusterSelector(DataSelector):
                          colors=["#4c72b0", "#dd8452", "#55a868"],
                          alpha=0.85)
 
-            if self.config.global_budget_pct is not None:
-                global_max = max(1, int(
-                    len(self._embeddings) * self.config.global_budget_pct / 100.0))
+            global_max = self._global_budget_max()
+            if global_max is not None:
                 ax.axhline(global_max, color="red", linestyle="--",
                            linewidth=1.0,
-                           label=f"global cap ({self.config.global_budget_pct:g}%)")
+                           label=f"global cap ({global_max} prompts)")
 
             ax.set_xlabel("Selection round")
             ax.set_ylabel("Cumulative unique samples")

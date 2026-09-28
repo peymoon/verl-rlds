@@ -13,6 +13,9 @@ nnodes: 0
 # Number of GPUs per node for rollout server.
 n_gpus_per_node: ${oc.select:trainer.n_gpus_per_node,8}
 
+# Base seed for rollout generation. Each replica offsets this by its rank.
+seed: 0
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

@@ -265,9 +265,8 @@ DENSITY_DIVERSE_RADIUS=${DENSITY_DIVERSE_RADIUS:-0.15}
 ROLLOUT_HISTORY_MAX_REFS=${ROLLOUT_HISTORY_MAX_REFS:-0}
 
 # --- Variance normalization ---
-# Normalize per-sample variance by mean*(1-mean) so binary-reward tasks
-# (math/mcq/digit) and continuous-reward tasks (IoU grounding) are scored
-# on a comparable [0,1] scale.
+# Scale raw variance by the fixed Bernoulli maximum: min(4 * variance, 1).
+# This keeps binary uncertainty graded from unanimous (0) to a 50/50 split (1).
 NORMALIZE_VARIANCE=${NORMALIZE_VARIANCE:-true}
 SELECTION_REWARD_KEY=${SELECTION_REWARD_KEY:-acc}
 

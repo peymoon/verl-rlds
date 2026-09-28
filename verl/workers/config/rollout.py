@@ -143,6 +143,9 @@ class RolloutConfig(BaseConfig):
     nnodes: int = 0
     n_gpus_per_node: int = 8
 
+    # Base seed for rollout inference engines. Replica rank is added by the backend.
+    seed: int = 0
+
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0

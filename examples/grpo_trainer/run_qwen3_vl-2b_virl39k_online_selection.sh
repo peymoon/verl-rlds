@@ -40,7 +40,6 @@ DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/data}"
 DATASET_NAME="virl39k"
 K_FINAL="${K_FINAL:-150}"
 N_REPS="${N_REPS:-3}"
-export WANDB_API_KEY='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'
 TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100_stratified_seed1234}"
 TEST_SPLIT="${TEST_SPLIT:-test_10_100_stratified_seed1234}"
 

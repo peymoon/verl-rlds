@@ -20,7 +20,6 @@ DATA_ROOT="${DATA_ROOT:-/workspace/rl_data_selection/data}"
 DS_ROOT="${DATA_ROOT}/virl39k"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train_90_100}"
 TEST_SPLIT="${TEST_SPLIT:-test_10_100}"
-export WANDB_API_KEY='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'
 TRAIN_PARQUET="${DS_ROOT}/parquet/${TRAIN_SPLIT}.parquet"
 VAL_PARQUET="${DS_ROOT}/parquet/${TEST_SPLIT}.parquet"
 

@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import hashlib
 import os
 import time
 import uuid
@@ -408,6 +409,11 @@ class RayPPOTrainer:
         self._data_selection_active = False
         self._data_selection_schedule = "epoch"
         self._data_selection_initial_pending = False
+        self._active_selection_indices = None
+        self._active_selection_index_set = set()
+        self._resume_epoch = None
+        self._resume_skip_epoch_reselect = False
+        self._current_epoch = 0
 
         ds_config = self.config.get("data_selection", None)
         if ds_config is None:
@@ -556,7 +562,14 @@ class RayPPOTrainer:
 
         selector = getattr(self, "data_selector", None)
         cluster_cfg = getattr(selector, "cluster_config", None)
-        key = str(getattr(cluster_cfg, "selection_reward_key", "reward") or "reward")
+        dots_cfg = getattr(selector, "dots_config", None)
+        vade_cfg = getattr(selector, "vade_config", None)
+        key = str(
+            getattr(cluster_cfg, "selection_reward_key", None)
+            or getattr(dots_cfg, "selection_reward_key", None)
+            or getattr(vade_cfg, "selection_reward_key", None)
+            or "reward"
+        )
 
         if not reward_extra_infos_dict or key in {"reward", "reward_tensor"}:
             return rewards
@@ -668,18 +681,72 @@ class RayPPOTrainer:
             return padded
         return np.zeros((0, n_rollouts), dtype=np.float32)
 
-    def _rebuild_dataloader(self, indices: list):
-        """Rebuild the training dataloader with a subset of the dataset.
+    @staticmethod
+    def _selection_indices_digest(indices: list[int]) -> str:
+        values = np.asarray(indices, dtype="<i8")
+        return hashlib.sha256(values.tobytes()).hexdigest()
 
-        Uses the same StatefulDataLoader + RandomSampler pattern as the
-        original _create_dataloader to preserve checkpoint resumption.
-        """
+    def _selection_config_digest(self) -> Optional[str]:
+        if not self._data_selection_active:
+            return None
+        payload = OmegaConf.to_container(
+            self.config.data_selection,
+            resolve=True,
+        )
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _checkpoint_seed_state(self) -> dict[str, Optional[int]]:
+        paths = {
+            "data": "data.seed",
+            "selection": "data_selection.seed",
+            "actor_fsdp": "actor_rollout_ref.actor.fsdp_config.seed",
+            "actor_full_determinism": (
+                "actor_rollout_ref.actor.fsdp_config.full_determinism"
+            ),
+            "actor_loader": "actor_rollout_ref.actor.data_loader_seed",
+            "reference_fsdp": "actor_rollout_ref.ref.fsdp_config.seed",
+            "reference_full_determinism": (
+                "actor_rollout_ref.ref.fsdp_config.full_determinism"
+            ),
+            "rollout": "actor_rollout_ref.rollout.seed",
+        }
+        result = {}
+        for name, path in paths.items():
+            value = OmegaConf.select(self.config, path, default=None)
+            result[name] = None if value is None else int(value)
+        return result
+
+    def _validate_selected_indices(self, indices: list) -> list[int]:
+        if not indices:
+            raise RuntimeError("Selected-data checkpoint contains no active training indices.")
+        normalized = [int(i) for i in indices]
+        bad = [i for i in normalized if i < 0 or i >= len(self.train_dataset)]
+        if bad:
+            raise RuntimeError(
+                "Selected-data checkpoint contains out-of-range dataset indices: "
+                f"{bad[:10]} (dataset size {len(self.train_dataset)})."
+            )
+        return normalized
+
+    def _rebuild_dataloader(self, indices: list):
+        """Rebuild the loader from the exact ordered selected index sequence."""
         from torch.utils.data import Subset
         from torchdata.stateful_dataloader import StatefulDataLoader
         from torchdata.stateful_dataloader.sampler import RandomSampler
 
+        indices = self._validate_selected_indices(indices)
         subset = Subset(self.train_dataset, indices)
-        sampler = RandomSampler(data_source=subset)
+        selection_round = int(getattr(self.data_selector, "_selection_round", 0))
+        base_seed = int(self.config.data_selection.get("seed", 42))
+        generator = torch.Generator()
+        generator.manual_seed(base_seed + 1009 * selection_round)
+        sampler = RandomSampler(data_source=subset, generator=generator)
 
         self.train_dataloader = StatefulDataLoader(
             dataset=subset,
@@ -689,9 +756,32 @@ class RayPPOTrainer:
             collate_fn=self.collate_fn,
             sampler=sampler,
         )
+        if len(self.train_dataloader) < 1:
+            raise RuntimeError(
+                f"Selected dataloader is empty: {len(indices)} rows for batch size "
+                f"{self.config.data.get('gen_batch_size', self.config.data.train_batch_size)}."
+            )
+        self._active_selection_indices = list(indices)
+        self._active_selection_index_set = set(indices)
 
         print(f"[DataSelection] Rebuilt dataloader: {len(self.train_dataloader)} batches "
               f"from {len(indices)}/{len(self.train_dataset)} samples")
+
+    def _assert_batch_within_active_selection(self, batch: DataProto) -> None:
+        if not self._data_selection_active or not self._active_selection_index_set:
+            return
+        values = batch.non_tensor_batch.get("dataset_idx")
+        if values is None:
+            raise RuntimeError(
+                "Selected-data invariant cannot be checked: batch has no dataset_idx field."
+            )
+        observed = {int(i) for i in np.asarray(values).reshape(-1)}
+        outside = observed - self._active_selection_index_set
+        if outside:
+            raise RuntimeError(
+                "Selected-data invariant violated; batch contains out-of-pool indices: "
+                f"{sorted(outside)[:10]}."
+            )
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1248,6 +1338,38 @@ class RayPPOTrainer:
             torch.save(self.data_selector.get_state_dict(), selector_local_path)
             print(f"Saved data selector state to {selector_local_path}")
 
+        if self._data_selection_active:
+            active_indices = self.data_selector.get_current_training_indices()
+            active_indices = self._validate_selected_indices(active_indices)
+            if active_indices != self._active_selection_indices:
+                raise RuntimeError(
+                    "Selector and active dataloader disagree; refusing to save a corrupt checkpoint."
+                )
+            selection_payload = {
+                "state_version": 3,
+                "dataset_size": len(self.train_dataset),
+                "indices": active_indices,
+                "sha256": self._selection_indices_digest(active_indices),
+            }
+            torch.save(
+                selection_payload,
+                os.path.join(local_global_step_folder, "data_selection_indices.pt"),
+            )
+
+        trainer_state = {
+            "state_version": 3,
+            "epoch": int(self._current_epoch),
+            "dataset_size": len(self.train_dataset),
+            "data_selection_active": bool(self._data_selection_active),
+            "data_selection_schedule": self._data_selection_schedule,
+            "data_selection_config_sha256": self._selection_config_digest(),
+            "train_files": str(self.config.data.train_files),
+            "val_files": str(self.config.data.val_files),
+            "total_training_steps": int(self.total_training_steps),
+            "seeds": self._checkpoint_seed_state(),
+        }
+        torch.save(trainer_state, os.path.join(local_global_step_folder, "trainer_state.pt"))
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1312,29 +1434,96 @@ class RayPPOTrainer:
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
+        trainer_state = None
+        if os.path.exists(trainer_state_path):
+            trainer_state = torch.load(trainer_state_path, weights_only=False)
+            if int(trainer_state.get("state_version", -1)) != 3:
+                raise RuntimeError(
+                    "Checkpoint trainer_state.pt is not the exact-resume v3 format. "
+                    "Start a fresh run with trainer.resume_mode=disable."
+                )
+            if int(trainer_state.get("dataset_size", -1)) != len(self.train_dataset):
+                raise RuntimeError(
+                    "Checkpoint dataset size mismatch: "
+                    f"checkpoint={trainer_state.get('dataset_size')}, "
+                    f"current={len(self.train_dataset)}."
+                )
+            if trainer_state.get("train_files") != str(self.config.data.train_files):
+                raise RuntimeError("Checkpoint train_files do not match the current run config.")
+            if trainer_state.get("val_files") != str(self.config.data.val_files):
+                raise RuntimeError("Checkpoint val_files do not match the current run config.")
+            if int(trainer_state.get("total_training_steps", -1)) != int(self.total_training_steps):
+                raise RuntimeError("Checkpoint total_training_steps do not match the current run config.")
+            if trainer_state.get("seeds") != self._checkpoint_seed_state():
+                raise RuntimeError(
+                    "Checkpoint seed configuration does not match the current run config."
+                )
+            if bool(trainer_state.get("data_selection_active")) != self._data_selection_active:
+                raise RuntimeError("Checkpoint data-selection mode does not match the current run.")
+            if trainer_state.get("data_selection_schedule") != self._data_selection_schedule:
+                raise RuntimeError("Checkpoint data-selection schedule does not match the current run.")
+            if (
+                trainer_state.get("data_selection_config_sha256")
+                != self._selection_config_digest()
+            ):
+                raise RuntimeError(
+                    "Checkpoint data-selection configuration does not match the current run."
+                )
+            self._resume_epoch = int(trainer_state.get("epoch", 0))
+            self._resume_skip_epoch_reselect = True
+        elif self._data_selection_active:
+            raise RuntimeError(
+                "Legacy selected-data checkpoint has no trainer_state.pt and cannot be "
+                "resumed exactly. Start a fresh run with trainer.resume_mode=disable."
+            )
 
-        # load data selector state (frozen pool, rollout buffer, budget tracking)
-        if self.data_selector is not None and hasattr(self.data_selector, "load_state_dict"):
+        # Restore selector state and rebuild the exact selected Subset BEFORE
+        # applying StatefulDataLoader cursor state. Loading data.pt into the
+        # full-data loader silently produces out-of-pool batches.
+        if self._data_selection_active:
             selector_local_path = os.path.join(global_step_folder, "data_selector.pt")
-            if os.path.exists(selector_local_path):
-                selector_state = torch.load(selector_local_path, weights_only=False)
-                self.data_selector.load_state_dict(selector_state)
-                # Pool is non-empty after restore → the initial selection already ran in a
-                # prior segment. Suppress re-firing it to prevent double-counting the budget.
-                if (hasattr(self.data_selector, "_ever_selected_set")
-                        and len(self.data_selector._ever_selected_set) > 0):
-                    self._data_selection_initial_pending = False
-            else:
-                print(f"Warning: No data selector state found at {selector_local_path}, "
-                      "selector will restart from scratch (frozen pool and rollout buffer lost)")
+            if not os.path.exists(selector_local_path):
+                raise RuntimeError("Selected-data checkpoint is missing data_selector.pt.")
+            selector_state = torch.load(selector_local_path, weights_only=False)
+            self.data_selector.load_state_dict(selector_state)
+
+            selection_path = os.path.join(global_step_folder, "data_selection_indices.pt")
+            if not os.path.exists(selection_path):
+                raise RuntimeError(
+                    "Selected-data checkpoint is missing data_selection_indices.pt."
+                )
+            selection_payload = torch.load(selection_path, weights_only=False)
+            if int(selection_payload.get("state_version", -1)) != 3:
+                raise RuntimeError("Selected-index checkpoint is not the exact-resume v3 format.")
+            if int(selection_payload.get("dataset_size", -1)) != len(self.train_dataset):
+                raise RuntimeError("Selected-index checkpoint dataset size mismatch.")
+
+            selector_indices = self.data_selector.get_current_training_indices()
+            payload_indices = selection_payload.get("indices")
+            if selector_indices and payload_indices and list(selector_indices) != list(payload_indices):
+                raise RuntimeError("Selector state and selected-index checkpoint disagree.")
+            active_indices = self._validate_selected_indices(payload_indices)
+            expected_digest = selection_payload.get("sha256")
+            actual_digest = self._selection_indices_digest(active_indices)
+            if expected_digest != actual_digest:
+                raise RuntimeError("Selected-index checkpoint hash mismatch.")
+            self.data_selector._last_selected_indices = list(active_indices)
+            self._rebuild_dataloader(active_indices)
+            self._data_selection_initial_pending = False
+
+        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        if not os.path.exists(dataloader_local_path):
+            raise RuntimeError(f"Checkpoint is missing dataloader state: {dataloader_local_path}")
+        dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+        self.train_dataloader.load_state_dict(dataloader_state_dict)
+
+        if self._data_selection_active and self._data_selection_schedule == "step":
+            # Checkpoints are saved before the post-step increment/reselection.
+            # Replay that pending boundary exactly before consuming the next batch.
+            self._data_selection_initial_pending = self.data_selector.should_reselect_step(
+                self.global_steps + 1
+            )
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1902,7 +2091,11 @@ class RayPPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        current_epoch = (
+            self._resume_epoch
+            if self._resume_epoch is not None
+            else self.global_steps // len(self.train_dataloader)
+        )
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1935,8 +2128,14 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            # --- Online data selection at epoch boundary (schedule=epoch only) ---
-            ds_metrics = self._maybe_reselect_data(epoch)
+            self._current_epoch = epoch
+            # A restored dataloader cursor is mid-epoch. Re-running the epoch
+            # boundary selector here would discard that exact continuation.
+            if self._resume_skip_epoch_reselect:
+                ds_metrics = {}
+                self._resume_skip_epoch_reselect = False
+            else:
+                ds_metrics = self._maybe_reselect_data(epoch)
             if ds_metrics:
                 logger.log(data=ds_metrics, step=self.global_steps)
 
@@ -1970,6 +2169,7 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                self._assert_batch_within_active_selection(batch)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch

@@ -54,7 +54,7 @@ class VariancePredictor(ABC):
                 rewards_array is shape (n_rollouts,) of raw per-rollout rewards.
             embeddings: (N, d) full dataset embeddings.
             current_step: current global training step (for time decay).
-            normalize_variance: if True, normalize by mean*(1-mean).
+            normalize_variance: if True, scale by the fixed Bernoulli maximum as min(4 * variance, 1).
         """
 
     @abstractmethod
@@ -140,11 +140,11 @@ def compute_predictor_diagnostics(
 
         # --- Fair variance R² against the empirical-mean-implied variance ---
         # Keep the target on the same scale as the selector's variance label:
-        # raw p_emp*(1-p_emp), or normalized max-variance indicator when the
-        # selector normalizes by p*(1-p).
+        # raw p_emp*(1-p_emp), or fixed-maximum scaling 4*p_emp*(1-p_emp)
+        # when the selector maps the Bernoulli maximum variance 0.25 to 1.0.
         obs_var_implied = obs_mean * (1.0 - obs_mean)
         if variance_normalized:
-            obs_var_implied = np.where(obs_var_implied > 1e-8, 1.0, 0.0)
+            obs_var_implied = np.minimum(4.0 * obs_var_implied, 1.0)
         ss_tot_vi = float(np.sum((obs_var_implied - obs_var_implied.mean()) ** 2))
         ss_res_vi = float(np.sum((pred_at_refs - obs_var_implied) ** 2))
         r2_v_implied = 1.0 - ss_res_vi / max(ss_tot_vi, 1e-12)
@@ -384,8 +384,7 @@ class KNNPredictor(VariancePredictor):
                 v = float(np.var(rewards)) if len(rewards) > 1 else 0.0
                 m = float(np.mean(rewards))
                 if normalize_variance and len(rewards) > 1:
-                    denom = max(m * (1.0 - m), 1e-8)
-                    v = min(v / denom, 1.0)
+                    v = min(4.0 * v, 1.0)
                 weighted_var += w * v
                 weighted_mean += w * m
                 total_w += w
@@ -591,8 +590,7 @@ class RidgePredictor(VariancePredictor):
                 m = float(np.mean(rewards))
                 v = float(np.var(rewards)) if n_r > 1 else 0.0
                 if normalize_variance and n_r > 1:
-                    denom = max(m * (1.0 - m), 1e-8)
-                    v = min(v / denom, 1.0)
+                    v = min(4.0 * v, 1.0)
                 wv += time_w * v
                 wm += time_w * m
                 total_w += time_w
@@ -881,8 +879,7 @@ class MLPPredictor(VariancePredictor):
                 m = float(np.mean(rewards))
                 v = float(np.var(rewards)) if n_r > 1 else 0.0
                 if normalize_variance and n_r > 1:
-                    denom = max(m * (1.0 - m), 1e-8)
-                    v = min(v / denom, 1.0)
+                    v = min(4.0 * v, 1.0)
                 wv += time_w * v
                 wm += time_w * m
                 total_w += time_w
@@ -1046,10 +1043,10 @@ class RandomScorePredictor(VariancePredictor):
       of embeddings or observations. `predicted_mean = 0.5` is neutral so
       dead-zone clipping and asymmetric utility do not fire (both are driven
       by predicted_mean from Head A per invariant 5 in CLAUDE.md).
-    - Each call to `predict` reseeds from `(selection_round, n_samples)` when
-      a round is set via `set_round(round_idx)`; otherwise uses a fresh draw.
-      The trainer calls `predict` once per selection round, so scores are
-      stable within a round and differ across rounds.
+    - Each call to `predict` reseeds from `selection_round` when a round is set
+      via `set_round(round_idx)`. The trainer calls `predict` once per
+      selection round, so scores are stable within a round and differ across
+      rounds.
     """
 
     def __init__(
@@ -1105,8 +1102,7 @@ class RandomScorePredictor(VariancePredictor):
                 v = float(np.var(rewards)) if len(rewards) > 1 else 0.0
                 m = float(np.mean(rewards))
                 if normalize_variance and len(rewards) > 1:
-                    denom = max(m * (1.0 - m), 1e-8)
-                    v = min(v / denom, 1.0)
+                    v = min(4.0 * v, 1.0)
                 weighted_var += w * v
                 weighted_mean += w * m
                 total_w += w

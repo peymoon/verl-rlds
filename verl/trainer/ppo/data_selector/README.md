@@ -120,12 +120,12 @@ These are the **active values** in the launch script `run_qwen3_vl-2b_online_sel
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `n_clusters` | 200 | Fine-grained clustering — ~113 samples per cluster |
-| `n_reps` | 3 | 3 medoids per cluster → 600 reference rollouts (round 0 only) |
+| `n_clusters` | 150 | Pinned K for the canonical ViRL39K artifact |
+| `n_reps` | 3 | Up to 450 representative rollouts (round 0 only) |
 | `reselect_schedule` | `step` | Reselect on step boundaries, not epoch boundaries |
 | `reselect_interval` | **4** | Reselect every 4 training steps — every-step proved too aggressive (burned the cap in ~17 steps and left training stuck in frozen-reweight) |
-| `selection_budget_pct` | **0.58%** | ~128 samples per round (one batch). Small per-round budget = many discovery rounds before hitting the cap |
-| `global_budget_pct` | **10.0%** | Hard cap on cumulative unique annotated samples — fair comparison vs random 10% baseline |
+| `budget_schedule` | **1.0% / 0.3% / 0.15%** | Phased discovery cadence at 50% and 85% cap utilization |
+| `global_budget_count` | **3,887** | Exact source-level 10% cap; probes count and random-10% has the same row count |
 | `exclude_already_selected` | **`true`** | Discovery mask: each round adds exactly `selection_budget` brand-new uniques (no resampling) |
 | `reroll_medoids` | **`false`** | Medoid rollouts run once at round 0; later rounds rely on the rollout-history buffer |
 | `strategy` | `interpolated` | Per-sample variance prediction via DOTS |
@@ -133,13 +133,12 @@ These are the **active values** in the launch script `run_qwen3_vl-2b_online_sel
 | `dots_diversity_temperature` | 0.5 | Warmer allocation → more uniform budget across clusters |
 | `dots_temperature` | 0.05 | Sharp DOTS interpolation — nearest refs dominate |
 | `dots_top_k` | 64 | Number of nearest references used per prediction |
-| `use_rollout_history` | `true` | Buffer grows organically from 600 medoids as training progresses |
+| `use_rollout_history` | `true` | Buffer grows organically from up to 450 representatives as training progresses |
 | `rollout_history_decay_rate` | 0.05 | Half-life ≈ 14 steps |
 | `rollout_history_max_refs` | **0** (unlimited) | No artificial cap; rely on `rollout_history_max_age` pruning instead. Older default of 2000 threw away recent observations the trainer had already paid for |
 | `exploration_enabled` | **`false`** | Disabled by default — discovery mask already prevents resampling, so the original "diversify the buffer" rationale is moot |
-| `asymmetric_utility_enabled` | `true` | Prefer harder samples at equal variance |
-| `hard_side_bias` | 0.5 | Mild bias toward hard side |
-| `asymmetric_dead_zone_low/high` | 0.05 / 0.95 | Zero out samples the policy already always-fails or always-passes |
+| `asymmetric_utility_enabled` | `false` | Disabled for the clean core-method regression |
+| `asymmetric_dead_zone_low/high` | 0.0 / 1.0 | No predicted-mean hard exclusion in the clean run |
 
 ## Quick Reference: Bash Parameters → Code
 
@@ -152,7 +151,8 @@ Every `data_selection.*` key in the bash script maps directly to a config field.
 | `data_selection.reselect_interval` | `1` | `base.py: should_reselect_epoch/step()` | Every N epochs or steps |
 | `data_selection.selection_budget_pct` | `100.0` | `base.py: get_selection_budget()` | % of full dataset to select |
 | `data_selection.selection_budget` | `None` | `base.py: get_selection_budget()` | Absolute sample count (overrides pct) |
-| `data_selection.global_budget_pct` | `None` | `base.py` + `cluster_selector.py: select()` | Cap on cumulative unique samples over the entire run (% of full dataset). When the union of all ever-selected samples reaches this cap, selection freezes and subsequent reselection rounds reweight inside the frozen pool. Set equal to `selection_budget_pct` for a fair comparison with a fixed random baseline. |
+| `data_selection.global_budget_pct` | `None` | `base.py` + `cluster_selector.py: select()` | Percentage cap relative to the selectable dataset. |
+| `data_selection.global_budget_count` | `None` | `cluster_selector.py: _global_budget_max()` | Exact cumulative unique-prompt cap; takes precedence over `global_budget_pct`. |
 | `data_selection.cluster.cluster_arrays_file` | `None` | `cluster_selector.py: _load_precomputed_clusters()` | Path to `.npz` with embeddings+centroids+assignments |
 | `data_selection.cluster.embeddings_file` | `None` | `cluster_selector.py: _load_embeddings_and_cluster()` | Path to raw embeddings (runs FAISS at startup) |
 | `data_selection.cluster.n_clusters` | `50` | `cluster_selector.py: _load_embeddings_and_cluster()` | K for KMeans (ignored if cluster_arrays_file given) |
@@ -176,9 +176,9 @@ Every `data_selection.*` key in the bash script maps directly to a config field.
 | `data_selection.cluster.rollout_history_decay_rate` | `0.05` | `cluster_selector.py: _compute_time_weighted_variances()` | λ in `exp(-λ * Δstep)`. Higher = faster decay of old observations. |
 | `data_selection.cluster.rollout_history_max_age` | `500` | `cluster_selector.py: update_rollout_history()` | Entries older than this many training steps are discarded from the buffer. |
 | `data_selection.cluster.rollout_history_max_refs` | `0` | `cluster_selector.py: _compute_time_weighted_variances()` | Maximum number of reference points passed to DOTS (keeps most recent). `0` = unlimited (rely on `rollout_history_max_age` pruning). |
-| `data_selection.cluster.exclude_already_selected` | `true` | `cluster_selector.py: _select_interpolated()` | **Discovery mask.** When true, the per-sample interpolated top-k zeros out any sample already in `_ever_selected_set`. Each pre-freeze round therefore adds exactly `selection_budget` brand-new uniques (selection without replacement), so the global cap corresponds to `per_round_budget × n_rounds`. |
+| `data_selection.cluster.exclude_already_selected` | `true` | `cluster_selector.py: _select_interpolated()` | **Discovery mask.** When true, the per-sample interpolated top-k zeros out any sample already in `_ever_selected_set`. Each pre-freeze round therefore adds up to the remaining `selection_budget` brand-new uniques (selection without replacement), so the global cap corresponds to `per_round_budget × n_rounds`. |
 | `data_selection.cluster.reroll_medoids` | `false` | `cluster_selector.py: get_reference_indices()` | When false, REPR medoid rollouts only fire on round 0; later rounds rely on the rollout-history buffer instead of re-rolling the same medoids. Saves a substantial amount of inference compute and avoids wasting global budget on medoids that the buffer already supersedes. |
-| `data_selection.cluster.dataset_json_file` | `None` | `cluster_selector.py: _build_alignment_from_json()` | **Required when NPZ and parquet have different row orderings.** Path to the JSON/JSONL used to build the cluster embeddings. The selector matches by `image` field to produce a bidirectional NPZ↔parquet index map. Without this, REPR rollouts and `select()` reference wrong parquet rows (silently incorrect selection). |
+| `data_selection.cluster.dataset_json_file` | `None` | `cluster_selector.py: _build_alignment_from_json()` | **Required.** JSON/JSONL source used to build the artifact. Startup requires a unique, exact qid bijection across artifact UIDs, source records, and filtered training rows; missing files, duplicates, length changes, and unmatched qids fail closed. |
 | `data_selection.cluster.exploration_enabled` | `false` | `cluster_selector.py: get_exploration_indices()` | Enable exploration rollouts on random un-selected samples to break feedback loops |
 | `data_selection.cluster.exploration_pct` | `5.0` | `cluster_selector.py: get_selection_budget_for_exploration()` | Percentage of full dataset to explore each round |
 | `data_selection.cluster.exploration_interval` | `1` | `cluster_selector.py: get_exploration_indices()` | Explore every N selection rounds |
@@ -444,19 +444,23 @@ via `get_wandb_images()`:
 | `data_selection/budget_breakdown` | Cumulative annotation budget by source (training / medoid / exploration) over selection rounds, with the global cap drawn as a horizontal line | Always on once `_budget_history` has any entries |
 | `data_selection/overlap_history` | Jaccard overlap between successive selection rounds, with a 0.5 reference line | Always on after round 2 |
 
-### Global Budget Cap (`global_budget_pct`)
+### Global Budget Cap (`global_budget_pct` / `global_budget_count`)
 
 By default, the online selector picks a fresh `selection_budget_pct`% subset each round. Because the model's capabilities change, different samples are selected each round, and the **cumulative** unique data seen over training grows well beyond the per-round budget (often 30–50%+). This makes comparison with a fixed random baseline unfair — the random baseline sees exactly `selection_budget_pct`% unique samples total.
 
 Setting `global_budget_pct` caps the cumulative unique sample count. Once the union of all ever-selected samples reaches the cap, the **pool composition freezes** (no new samples). But periodic reselection rounds continue — they just skip reference/exploration rollouts and instead **reweight within the frozen pool** using training-batch reward variance.
 
-**Typical usage — fair comparison with random 10%:**
+**Canonical ViRL39K source-level 10% usage:**
 ```bash
-data_selection.selection_budget_pct=10.0 \
-data_selection.global_budget_pct=10.0
+data_selection.global_budget_pct=10.0 \
+data_selection.global_budget_count=3887 \
+data_selection.cluster.count_medoids_in_budget=true
 ```
 
-With `global_budget_pct == selection_budget_pct`, the first selection round uses initial-policy rollouts + DOTS interpolation to pick the smartest 10% of the dataset, then freezes the pool. The model trains on exactly 10% unique samples — identical data volume to the random baseline — but the *which* 10% is variance-informed rather than random.
+The absolute count takes precedence. This matters because selection operates on
+the 34,983-row train split while the paper's 10% denominator and random subset
+use the 38,870-prompt source corpus. The 3,887 cap includes representative
+probes, exploration, and training prompts before the pool freezes.
 
 **Adaptive reweighting within the frozen pool:**
 
@@ -511,7 +515,7 @@ If `use_rollout_history=False`, the reweight falls back to uniform sampling (all
 
 **Symptom (prior to fix):** With `use_rollout_history=True` and `n_reps` small enough that REPR medoids don't fill the buffer, the `DOTS reference: N samples` log line was stuck at exactly the REPR medoid count across all training rounds instead of growing toward `max_refs`.
 
-**Root cause:** The training loop assigned random `uuid4()` session IDs to each batch. The `update_rollout_history()` method tried to map these back to dataset positions via `_uid_to_dataset_idx`, which is keyed on image-path strings. Every lookup returned `None` — no training-batch rollout ever entered the buffer.
+**Root cause:** The training loop assigned random `uuid4()` session IDs to each batch. The `update_rollout_history()` method tried to map these back to dataset positions via `_uid_to_dataset_idx`, which is keyed on stable dataset qids. Every lookup returned `None` — no training-batch rollout ever entered the buffer.
 
 **Fix (applied):** `verl/utils/dataset/rl_dataset.py` now emits `dataset_idx`; `ray_trainer.py` passes it to `update_rollout_history()`; the selector uses direct integer lookups.
 
@@ -578,39 +582,40 @@ and training stalled.
 
 **Fix (applied):** `DataSelector.set_min_training_pool_size(n)` is called by
 the trainer at init with `n = train_batch_size`. At the end of `select()`,
-if the strategy returns fewer than `n` indices, the selector pads up to the
-floor by drawing from `_ever_selected_set` — samples already annotated and
-already counted against the global budget, so padding is free in annotation
-terms. If the already-annotated pool is too small (very early rounds), the
-padding falls back to random draws from the full parquet dataset; those
-extras are **not** added to `_ever_selected_*` so they don't inflate the
-annotation count.
+if discovery returns fewer rows, the selector pads with replacement from the
+current selection and previously verified pool only. Reused prompts were
+already counted, so the unique-prompt budget remains exact. There is no
+full-dataset random fallback; if no verified row exists, selection fails
+closed instead of consuming unaccounted labels.
 
-**How to verify:** Log line `[ClusterSelector] Padding training pool
-{before} -> {after} (floor={n}, source={pool|pool+random|random})` appears
-in the round where the phase transition happens, followed by `Rebuilt
-dataloader: N batches from >= train_batch_size samples`.
+**How to verify:** The log reports
+`source=verified_pool(replacement)`, and
+`len(_budget_counted_set())` never exceeds the configured global cap.
 
 ---
 
-#### Bug fix: NPZ row order ≠ parquet row order (silent wrong selection)
+#### Bug fix: NPZ row order differs from parquet row order
 
-**Symptom (prior to fix):** Online selection produced results indistinguishable from random despite the cluster pipeline appearing to "work" (logs showed variance measurements, DOTS references, etc.).
+**Symptom (prior to fix):** The pipeline logged plausible variance and
+selection statistics while training on unrelated parquet rows.
 
-**Root cause:** `cluster_arrays.npz` and the training parquet are built by separate pipelines with **different row orderings**. The original code used NPZ row indices as parquet positions, picking completely unrelated samples.
+**Root cause:** Cluster artifacts and parquet files were produced by separate
+pipelines with different row orderings. Positional NPZ indices are therefore
+not dataset indices.
 
-**Fix (applied):** New `dataset_json_file` config field. At `initialize()`, the selector loads the JSON, matches by `image` field against the parquet, and builds bidirectional `_npz_to_dataset` / `_dataset_to_npz` alignment maps. All outputs are remapped before returning.
+**Fix (applied):** `dataset_json_file` is mandatory. At startup, the selector
+requires unique non-empty qids in the NPZ `uids`, source JSON/JSONL, and
+filtered training dataset, then constructs the two directional maps by qid.
+The three qid sets and row counts must match exactly. Image-name and
+positional fallbacks are disabled.
 
 **How to verify:**
 ```
-# Good — full alignment:
-[ClusterSelector] Alignment: 22675/22675 NPZ rows matched to parquet rows
-
-# Bad — dataset_json_file not set:
-[ClusterSelector] WARNING: dataset_json_file not set. Assuming NPZ row order == parquet row order.
+[ClusterSelector] Alignment (qid): exact 34983/34983 artifact/source/training bijection
 ```
 
-**Required for all use cases**, not just `use_rollout_history`. Every strategy is affected.
+Missing sources, missing or duplicate qids, filtered row-count changes, and
+any unmatched record now raise before the first rollout.
 
 ---
 
@@ -905,7 +910,7 @@ When data selection is active, the following metrics are logged at each selectio
 | `data_selection/budget_breakdown/medoid` | Cumulative unique samples consumed by REPR medoid rollouts (round 0 only when `reroll_medoids=false`). |
 | `data_selection/budget_breakdown/exploration` | Cumulative unique samples consumed by exploration rollouts (zero when exploration is disabled). |
 | `data_selection/budget_breakdown/{training,medoid,exploration}_pct` | Same as above, normalized by `cumulative_unique_selected` (sum to 100). |
-| `data_selection/global_budget` | Absolute global budget cap (in samples) when `global_budget_pct` is set. |
+| `data_selection/global_budget` | Effective absolute global budget cap, from `global_budget_count` or `global_budget_pct`. |
 | `data_selection/global_budget_utilization_pct` | Cumulative unique samples / global cap × 100. Hits 100 at the moment the pool freezes. |
 | `data_selection/selection_frozen` | 0 / 1 indicator: 1 once the pool has frozen and frozen-reweight has taken over. |
 | `data_selection/n_clusters_ever_selected` | How many distinct clusters have had samples selected across all rounds. |
@@ -1126,29 +1131,25 @@ _select_interpolated / _select_frozen_reweight   ← unchanged allocation logic
 ### Two-head design (Ridge and MLP)
 
 **Why two heads, not one.** The original single-head design regressed on mean
-reward `p_hat` and derived variance analytically as `v_hat = p_hat * (1 - p_hat)`.
-For binary GRPO rewards this derivation is theoretically correct for a single
-Bernoulli trial, but it has a hard consequence at prediction time: the parabola
-`p*(1−p)` peaks at **0.25** when `p=0.5`. So every scatter plot of
-`predicted_var` vs observed normalized variance ended up with the predicted
-axis capped at `[0, 0.25]` while the observed axis spanned `[0, 1]`, making
-`R²` meaningless and visually misleading (KNN's free-range interpolator
-appeared to "fit" vastly better even though its LOO R² was negative).
+reward `p_hat` and derived raw Bernoulli variance as
+`v_hat = p_hat * (1 - p_hat)`. That prediction is capped at **0.25**, while
+the selector's target is now fixed-maximum-scaled empirical variance,
+`v_obs = min(4 * Var(rewards), 1)`, on `[0, 1]`. Comparing an unscaled
+prediction to that target makes diagnostics and ranking inconsistent.
 
-Beyond the cosmetic issue, the derivation conflates two distinct quantities
-that matter for data selection:
+The fixed denominator is important. Dividing each binary group's empirical
+variance by its own `p*(1-p)` collapses every non-unanimous group to exactly
+1. Fixed-maximum scaling retains useful resolution: with eight rollouts,
+1/8 successes gives 0.4375, 2/8 gives 0.75, 4/8 gives 1, and unanimous
+outcomes give 0. Time-weighting this per-observation statistic also
+distinguishes consistently mixed groups from rounds that alternate between
+all-correct and all-wrong.
 
-- **Theoretical Bernoulli variance** `p(1−p)` — what head A's derivation
-  reports. Informs "where does the policy sit around 50/50?"
-- **Normalized empirical variance** `Var(rewards) / (p(1−p))` ∈ `[0, 1]` —
-  what the selector actually ranks by. Informs "how much of the theoretical
-  maximum uncertainty does this particular prompt realize under this policy?"
+The two targets therefore serve different roles:
 
-A prompt with steady 4/8 splits across rounds has normalized variance ≈ 1
-(saturated learning signal), while a prompt that alternates 8/0 and 0/8
-across rounds at `p_avg ≈ 0.5` also looks like theoretical variance 0.25 to
-Head A but has normalized variance much lower. The ranking target and the
-derivation target are not the same thing.
+- **Mean reward** `p` locates easy and hard prompts and supports dead zones.
+- **Scaled empirical variance** `min(4*Var(rewards), 1)` measures the graded
+  within-group learning signal on the selector's common `[0, 1]` scale.
 
 **What the two heads do.**
 
@@ -1166,7 +1167,7 @@ derivation target are not the same thing.
   directly optimized for the quantity the selector will rank on.
 
 **Cold-start behavior.** Before the first fit with enough observed samples,
-Head B falls back to the old `p(1−p)` derivation automatically. Subsequent
+Head B falls back to `min(4p(1−p), 1)` automatically. Subsequent
 rounds use the direct head once `obs_var_per_sample` is non-empty. For MLP
 specifically, the variance head sigmoid starts at 0.5 and warms up over the
 first 3–5 selection rounds as gradients accumulate — this is visible in the
